@@ -26,6 +26,19 @@ MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 
+# The bridge writes media inside the container, so the path it returns is
+# meaningless to a client running anywhere else. When the store is a bind mount,
+# these two say how to rewrite the container path into the caller's path.
+MEDIA_CONTAINER_PATH = os.environ.get("WHATSAPP_MEDIA_CONTAINER_PATH", "/app/whatsapp-bridge/store")
+MEDIA_HOST_PATH = os.environ.get("WHATSAPP_MEDIA_HOST_PATH", "")
+
+
+def _host_visible_path(file_path: str) -> str:
+    """Rewrite a container media path into the path the caller can open."""
+    if not MEDIA_HOST_PATH or not file_path.startswith(MEDIA_CONTAINER_PATH):
+        return file_path
+    return MEDIA_HOST_PATH.rstrip("/") + file_path[len(MEDIA_CONTAINER_PATH):]
+
 mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
 
@@ -268,7 +281,7 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         return {
             "success": True,
             "message": "Media downloaded successfully",
-            "file_path": file_path
+            "file_path": _host_visible_path(file_path)
         }
     else:
         return {
