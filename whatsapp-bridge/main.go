@@ -412,11 +412,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	chat := canonicalJID(client, msg.Info.Chat)
+	chatJID := chat.String()
+	sender := canonicalJID(client, msg.Info.Sender).User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -848,9 +849,11 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
-			// Names already sitting in the contact store never reach chat rows
-			// written before the contact was known, so sweep them on connect.
-			go refreshAllChatNames(client, messageStore, logger)
+			// Fold split conversations back together first, then name what is left.
+			go func() {
+				mergeLIDChats(client, messageStore, logger)
+				refreshAllChatNames(client, messageStore, logger)
+			}()
 			// The address book behind FullName/FirstName only arrives through app
 			// state sync. Without asking for it the contact list stays empty and
 			// every individual chat falls back to the phone number.
@@ -1033,6 +1036,23 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	return name
 }
 
+// canonicalJID collapses the two addresses WhatsApp may use for the same person
+// onto one. Direct chats now arrive under the LID address while older history and
+// the contact list use the phone number, so storing whichever address an event
+// happened to carry splits one conversation across two chat rows and hides new
+// messages from any lookup by phone number.
+func canonicalJID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.IsEmpty() {
+		// LID-only contacts have no phone number to fall back to.
+		return jid
+	}
+	return pn.ToNonAD()
+}
+
 // resolveContactName finds the best display name for an individual contact.
 //
 // LID-addressed chats carry an opaque identity number instead of a phone number,
@@ -1105,6 +1125,97 @@ func refreshChatName(client *whatsmeow.Client, messageStore *MessageStore, jid t
 	}
 }
 
+// mergeLIDChats folds a chat stored under a LID address into the row for the same
+// person's phone number. Conversations recorded before addresses were normalized
+// are split in two, with recent messages under one address and older history
+// under the other, so a lookup by phone number returns a stale chat and the new
+// messages look missing.
+func mergeLIDChats(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	rows, err := messageStore.db.Query("SELECT jid, name, last_message_time FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		logger.Warnf("Failed to list LID chats: %v", err)
+		return
+	}
+
+	type lidChat struct {
+		jid      string
+		name     string
+		lastTime time.Time
+	}
+	var pending []lidChat
+	for rows.Next() {
+		var c lidChat
+		if err := rows.Scan(&c.jid, &c.name, &c.lastTime); err != nil {
+			continue
+		}
+		pending = append(pending, c)
+	}
+	rows.Close()
+
+	merged := 0
+	for _, c := range pending {
+		jid, err := types.ParseJID(c.jid)
+		if err != nil {
+			continue
+		}
+		target := canonicalJID(client, jid)
+		if target.Server == types.HiddenUserServer {
+			// No phone number is known for this LID, so there is nothing to fold into.
+			continue
+		}
+		targetJID := target.String()
+
+		tx, err := messageStore.db.Begin()
+		if err != nil {
+			logger.Warnf("Failed to begin merge for %s: %v", c.jid, err)
+			continue
+		}
+
+		steps := []struct {
+			query string
+			args  []interface{}
+		}{
+			// The target row has to exist before any message can point at it,
+			// because messages.chat_jid is a foreign key into chats.
+			{`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+			  ON CONFLICT(jid) DO UPDATE SET
+			    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE chats.name END,
+			    last_message_time = MAX(chats.last_message_time, excluded.last_message_time)`,
+				[]interface{}{targetJID, c.name, c.lastTime}},
+			// Senders were recorded under the LID too.
+			{"UPDATE messages SET sender = ? WHERE chat_jid = ? AND sender = ?",
+				[]interface{}{target.User, c.jid, jid.User}},
+			// A message present under both addresses would collide on the
+			// (id, chat_jid) primary key, so drop the duplicate instead of failing.
+			{"DELETE FROM messages WHERE chat_jid = ? AND id IN (SELECT id FROM messages WHERE chat_jid = ?)",
+				[]interface{}{c.jid, targetJID}},
+			{"UPDATE messages SET chat_jid = ? WHERE chat_jid = ?",
+				[]interface{}{targetJID, c.jid}},
+			{"DELETE FROM chats WHERE jid = ?", []interface{}{c.jid}},
+		}
+
+		failed := false
+		for _, step := range steps {
+			if _, err := tx.Exec(step.query, step.args...); err != nil {
+				logger.Warnf("Failed to merge %s into %s: %v", c.jid, targetJID, err)
+				failed = true
+				break
+			}
+		}
+		if failed {
+			tx.Rollback()
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			logger.Warnf("Failed to commit merge for %s: %v", c.jid, err)
+			continue
+		}
+		merged++
+	}
+
+	logger.Infof("LID chat merge: %d of %d folded into phone-number rows", merged, len(pending))
+}
+
 // refreshAllChatNames sweeps every individual chat still stored under the number
 // placeholder and re-resolves it. Rows written before a contact was known are
 // never revisited by the normal message path, so without this sweep the names
@@ -1169,6 +1280,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
 			continue
 		}
+
+		// Store history under the same address new messages use, otherwise the
+		// two halves of one conversation land in separate chat rows.
+		jid = canonicalJID(client, jid)
+		chatJID = jid.String()
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
