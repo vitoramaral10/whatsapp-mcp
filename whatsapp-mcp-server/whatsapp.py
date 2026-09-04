@@ -9,6 +9,9 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# The bridge's own store, holding the contact list and the LID -> phone map.
+# Contacts do not exist in messages.db at all.
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
 
 @dataclass
@@ -392,44 +395,83 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    The contact list lives in the bridge's store (whatsmeow_contacts), not in
+    messages.db. Searching only the chats table would miss everyone the user has
+    never exchanged a message with, and would match against the phone-number
+    placeholder that chats.name falls back to instead of a real name.
+    """
+    conn = None
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=5.0)
+        conn.execute("ATTACH DATABASE ? AS wa", (WHATSAPP_DB_PATH,))
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
+
+        search_pattern = '%' + query + '%'
+
+        # FullName/FirstName come from the phone's address book and are only
+        # present once app state sync has run; PushName is the name the contact
+        # chose for themselves. Preferring them in this order keeps the address
+        # book authoritative without going nameless when it has not synced.
+        best_name = ("COALESCE(NULLIF(full_name, ''), NULLIF(business_name, ''), "
+                     "NULLIF(first_name, ''), NULLIF(push_name, ''))")
+
+        cursor.execute(f"""
+            SELECT their_jid, {best_name} AS name
+            FROM wa.whatsmeow_contacts
+            WHERE their_jid NOT LIKE '%@g.us'
+              AND (LOWER(COALESCE({best_name}, '')) LIKE LOWER(?)
+                   OR LOWER(their_jid) LIKE LOWER(?))
         """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
+        contact_rows = cursor.fetchall()
+
+        # LID-addressed chats store an opaque identity number. Map it back to the
+        # phone number so those chats deduplicate against the contact list.
+        cursor.execute("SELECT lid, pn FROM wa.whatsmeow_lid_map")
+        lid_to_pn = dict(cursor.fetchall())
+
+        # Chats still carry people who are not in the address book at all.
+        cursor.execute("""
+            SELECT jid, name FROM chats
+            WHERE jid NOT LIKE '%@g.us'
+              AND (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+        """, (search_pattern, search_pattern))
+        chat_rows = cursor.fetchall()
+
+        def phone_of(jid: str) -> str:
+            user = jid.split('@')[0]
+            return lid_to_pn.get(user, user)
+
+        # Keyed by phone number so the same person found through both sources
+        # collapses into one entry; a real name always beats the number.
+        merged = {}
+        for jid, name in list(contact_rows) + list(chat_rows):
+            if not jid:
+                continue
+            phone = phone_of(jid)
+            name = (name or '').strip()
+            existing = merged.get(phone)
+            if existing is not None and existing.name and existing.name != phone:
+                continue
+            merged[phone] = Contact(
+                phone_number=phone,
+                name=name or phone,
+                jid=f"{phone}@s.whatsapp.net" if phone.isdigit() else jid,
             )
-            result.append(contact)
-            
-        return result
-        
+
+        # Named contacts first, so a useful match is never buried under numbers.
+        result = sorted(
+            merged.values(),
+            key=lambda c: (c.name == c.phone_number, c.name.lower()),
+        )
+        return result[:50]
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
     finally:
-        if 'conn' in locals():
+        if conn is not None:
             conn.close()
 
 

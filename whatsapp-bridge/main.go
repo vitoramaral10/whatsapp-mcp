@@ -23,6 +23,7 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -54,7 +55,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -847,6 +848,32 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Names already sitting in the contact store never reach chat rows
+			// written before the contact was known, so sweep them on connect.
+			go refreshAllChatNames(client, messageStore, logger)
+			// The address book behind FullName/FirstName only arrives through app
+			// state sync. Without asking for it the contact list stays empty and
+			// every individual chat falls back to the phone number.
+			go func() {
+				if err := client.FetchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, false, true); err != nil {
+					logger.Warnf("Failed to fetch contact list app state: %v", err)
+				}
+			}()
+
+		case *events.AppStateSyncComplete:
+			logger.Infof("App state sync complete: %s", v.Name)
+			if v.Name == appstate.WAPatchCriticalUnblockLow {
+				go refreshAllChatNames(client, messageStore, logger)
+			}
+
+		case *events.Contact:
+			refreshChatName(client, messageStore, v.JID, logger)
+
+		case *events.PushName:
+			refreshChatName(client, messageStore, v.JID, logger)
+
+		case *events.BusinessName:
+			refreshChatName(client, messageStore, v.JID, logger)
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -924,10 +951,13 @@ func main() {
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a real name.
+	// A stored name equal to the JID's user part is the placeholder written when
+	// the contact could not be resolved. Treating it as a name freezes the number
+	// forever, so it is deliberately not accepted here and the lookup runs again.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -987,14 +1017,12 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
+		name = resolveContactName(client, jid, logger)
+		if name == "" && sender != "" {
 			// Fallback to sender
 			name = sender
-		} else {
+		}
+		if name == "" {
 			// Last fallback to JID
 			name = jid.User
 		}
@@ -1003,6 +1031,123 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	}
 
 	return name
+}
+
+// resolveContactName finds the best display name for an individual contact.
+//
+// LID-addressed chats carry an opaque identity number instead of a phone number,
+// so they are mapped back to the phone JID before the contact is looked up.
+//
+// FullName and FirstName come from the phone's address book and only arrive
+// through app state sync; PushName is the name the contact chose for themselves
+// and is usually the only one present. Trying them in order lets the address
+// book win when it exists without leaving the chat nameless when it does not.
+func resolveContactName(client *whatsmeow.Client, jid types.JID, logger waLog.Logger) string {
+	ctx := context.Background()
+
+	lookupJID := jid
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			lookupJID = pn
+		} else if err != nil {
+			logger.Warnf("Failed to resolve LID %s: %v", jid, err)
+		}
+	}
+
+	contact, err := client.Store.Contacts.GetContact(ctx, lookupJID)
+	if err != nil {
+		logger.Warnf("Failed to get contact %s: %v", lookupJID, err)
+		return ""
+	}
+
+	for _, candidate := range []string{contact.FullName, contact.BusinessName, contact.FirstName, contact.PushName} {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// refreshChatName rewrites a chat row that is still holding the number
+// placeholder, for use when a name arrives after the chat was first stored.
+// The chat may be filed under either the phone JID or the LID, so both forms
+// are updated.
+func refreshChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, logger waLog.Logger) {
+	name := resolveContactName(client, jid, logger)
+	if name == "" {
+		return
+	}
+
+	ctx := context.Background()
+	candidates := []types.JID{jid.ToNonAD()}
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			candidates = append(candidates, pn.ToNonAD())
+		}
+	} else {
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid); err == nil && !lid.IsEmpty() {
+			candidates = append(candidates, lid.ToNonAD())
+		}
+	}
+
+	for _, candidate := range candidates {
+		res, err := messageStore.db.Exec(
+			"UPDATE chats SET name = ? WHERE jid = ? AND (name = '' OR name = ?)",
+			name, candidate.String(), candidate.User,
+		)
+		if err != nil {
+			logger.Warnf("Failed to update chat name for %s: %v", candidate, err)
+			continue
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			logger.Infof("Updated chat name for %s to %s", candidate, name)
+		}
+	}
+}
+
+// refreshAllChatNames sweeps every individual chat still stored under the number
+// placeholder and re-resolves it. Rows written before a contact was known are
+// never revisited by the normal message path, so without this sweep the names
+// already in the contact store would stay invisible.
+func refreshAllChatNames(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	rows, err := messageStore.db.Query("SELECT jid, name FROM chats WHERE jid NOT LIKE '%@g.us'")
+	if err != nil {
+		logger.Warnf("Failed to list chats for name refresh: %v", err)
+		return
+	}
+
+	type chatRow struct{ jid, name string }
+	var pending []chatRow
+	for rows.Next() {
+		var c chatRow
+		if err := rows.Scan(&c.jid, &c.name); err != nil {
+			continue
+		}
+		pending = append(pending, c)
+	}
+	rows.Close()
+
+	updated := 0
+	for _, c := range pending {
+		jid, err := types.ParseJID(c.jid)
+		if err != nil {
+			continue
+		}
+		if c.name != "" && c.name != jid.User {
+			continue
+		}
+		name := resolveContactName(client, jid, logger)
+		if name == "" || name == c.name {
+			continue
+		}
+		if _, err := messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, c.jid); err != nil {
+			logger.Warnf("Failed to update chat name for %s: %v", c.jid, err)
+			continue
+		}
+		updated++
+	}
+
+	logger.Infof("Chat name refresh: %d of %d chats updated", updated, len(pending))
 }
 
 // Handle history sync events
