@@ -1,4 +1,6 @@
 from typing import List, Dict, Any, Optional
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -16,7 +18,33 @@ from whatsapp import (
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+import os
+
+# Transport/bind are configurable so the same server can run as stdio (upstream
+# default) or as a streamable-http service inside Docker.
+MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+
+mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
+
+
+def _jsonable(value):
+    """Convert the dataclasses whatsapp.py returns into plain JSON-safe structures.
+
+    The MCP SDK validates tool results against the declared return annotation, so
+    Chat/Contact/Message instances have to be flattened before they are returned.
+    """
+    if is_dataclass(value) and not isinstance(value, type):
+        return {k: _jsonable(v) for k, v in asdict(value).items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -26,7 +54,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return _jsonable(contacts)
 
 @mcp.tool()
 def list_messages(
@@ -40,7 +68,7 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> str:
     """Get WhatsApp messages matching specified criteria with optional context.
     
     Args:
@@ -67,7 +95,9 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    # whatsapp.list_messages returns a preformatted transcript (and [] when the
+    # query fails), so the annotation above is str, not a list of dicts.
+    return messages if isinstance(messages, str) else ""
 
 @mcp.tool()
 def list_chats(
@@ -93,7 +123,7 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return _jsonable(chats)
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
@@ -104,7 +134,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return _jsonable(chat)
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
@@ -114,7 +144,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return _jsonable(chat)
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -126,7 +156,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return _jsonable(chats)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -152,7 +182,7 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return _jsonable(context)
 
 @mcp.tool()
 def send_message(
@@ -248,4 +278,4 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Initialize and run the server
-    mcp.run(transport='stdio')
+    mcp.run(transport=MCP_TRANSPORT)
