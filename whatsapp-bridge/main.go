@@ -204,7 +204,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -363,13 +363,48 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
+	// WhatsApp does not echo a message back to the device that sent it, so an
+	// outgoing message reaches the database only if it is recorded right here.
+	// Without this the message is delivered normally but never appears in
+	// history, which reads as "only received messages are stored".
+	if messageStore != nil {
+		storeSentMessage(client, messageStore, recipientJID, msg, message, resp.ID, resp.Timestamp)
+	}
+
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// storeSentMessage records a message this client just sent, so history holds both
+// sides of the conversation. Media fields are read back from the built protobuf,
+// which already carries the upload result, keeping sent media downloadable later.
+func storeSentMessage(client *whatsmeow.Client, messageStore *MessageStore, recipientJID types.JID, msg *waProto.Message, content string, id string, timestamp time.Time) {
+	chat := canonicalJID(client, recipientJID.ToNonAD())
+	chatJID := chat.String()
+
+	sender := ""
+	if client.Store.ID != nil {
+		sender = canonicalJID(client, client.Store.ID.ToNonAD()).User
+	}
+
+	name := GetChatName(client, messageStore, chat, chatJID, nil, "", waLog.Noop)
+	if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+		fmt.Printf("Failed to store chat for sent message: %v\n", err)
+		return
+	}
+
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+	if err := messageStore.StoreMessage(
+		id, chatJID, sender, content, timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	); err != nil {
+		fmt.Printf("Failed to store sent message: %v\n", err)
+	}
 }
 
 // Extract media info from a message
@@ -708,7 +743,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
