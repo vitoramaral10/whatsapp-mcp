@@ -30,6 +30,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -173,21 +174,333 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Extract text content from a message
+// textBuilder collects the non-empty pieces of a rendered message, so a renderer
+// can append every optional field without producing blank lines.
+type textBuilder struct {
+	parts []string
+}
+
+func (b *textBuilder) add(text string) {
+	if text = strings.TrimSpace(text); text != "" {
+		b.parts = append(b.parts, text)
+	}
+}
+
+func (b *textBuilder) String() string {
+	return strings.Join(b.parts, "\n")
+}
+
+// bulletFor renders one selectable option as "- label: detail [id]", keeping the
+// id because bots that use native menus expect it back as the selection.
+func bulletFor(label, detail, id string) string {
+	if label == "" && id == "" {
+		return ""
+	}
+	if label == "" {
+		label = id
+		id = ""
+	}
+	line := "- " + label
+	if detail != "" {
+		line += ": " + detail
+	}
+	if id != "" {
+		line += " [" + id + "]"
+	}
+	return line
+}
+
+// Extract text content from a message.
+//
+// Beyond plain chats this unwraps the container messages (ephemeral, view-once,
+// edited) and flattens the interactive types business bots use for menus — list,
+// buttons, template and native flow. Without that, a menu carries no
+// `conversation` field and handleMessage drops it before it ever reaches the
+// database, so the chat looks like the bot answered nothing.
 func extractTextContent(msg *waProto.Message) string {
-	if msg == nil {
+	return extractTextContentDepth(msg, 0)
+}
+
+func extractTextContentDepth(msg *waProto.Message, depth int) string {
+	// The depth cap guards against a malformed message nesting containers forever.
+	if msg == nil || depth > 4 {
 		return ""
 	}
 
-	// Try to get text content
-	if text := msg.GetConversation(); text != "" {
-		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	// Container messages carry the real payload one level down.
+	for _, inner := range []*waProto.Message{
+		msg.GetEphemeralMessage().GetMessage(),
+		msg.GetViewOnceMessage().GetMessage(),
+		msg.GetViewOnceMessageV2().GetMessage(),
+		msg.GetViewOnceMessageV2Extension().GetMessage(),
+		msg.GetDocumentWithCaptionMessage().GetMessage(),
+		msg.GetEditedMessage().GetMessage(),
+		msg.GetDeviceSentMessage().GetMessage(),
+	} {
+		if text := extractTextContentDepth(inner, depth+1); text != "" {
+			return text
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Plain text.
+	if text := msg.GetConversation(); text != "" {
+		return text
+	}
+	if text := msg.GetExtendedTextMessage().GetText(); text != "" {
+		return text
+	}
+
+	// Media captions. extractMediaInfo already records the attachment itself; the
+	// caption is the part a reader needs and it used to be dropped.
+	for _, caption := range []string{
+		msg.GetImageMessage().GetCaption(),
+		msg.GetVideoMessage().GetCaption(),
+		msg.GetDocumentMessage().GetCaption(),
+	} {
+		if caption != "" {
+			return caption
+		}
+	}
+
+	// Interactive menus, in the four shapes WhatsApp bots use.
+	if list := msg.GetListMessage(); list != nil {
+		if text := renderListMessage(list); text != "" {
+			return text
+		}
+	}
+	if buttons := msg.GetButtonsMessage(); buttons != nil {
+		if text := renderButtonsMessage(buttons); text != "" {
+			return text
+		}
+	}
+	if template := msg.GetTemplateMessage(); template != nil {
+		if text := renderTemplateMessage(template, depth); text != "" {
+			return text
+		}
+	}
+	if interactive := msg.GetInteractiveMessage(); interactive != nil {
+		if text := renderInteractiveMessage(interactive); text != "" {
+			return text
+		}
+	}
+
+	// The replies to those menus, which matter because outgoing messages are
+	// stored too: without this our own selection is invisible in the history.
+	if reply := msg.GetListResponseMessage(); reply != nil {
+		var b textBuilder
+		b.add(reply.GetTitle())
+		b.add(reply.GetDescription())
+		b.add(reply.GetSingleSelectReply().GetSelectedRowID())
+		if text := b.String(); text != "" {
+			return text
+		}
+	}
+	if reply := msg.GetButtonsResponseMessage(); reply != nil {
+		if text := firstNonEmpty(reply.GetSelectedDisplayText(), reply.GetSelectedButtonID()); text != "" {
+			return text
+		}
+	}
+	if reply := msg.GetTemplateButtonReplyMessage(); reply != nil {
+		if text := firstNonEmpty(reply.GetSelectedDisplayText(), reply.GetSelectedID()); text != "" {
+			return text
+		}
+	}
+	if reply := msg.GetInteractiveResponseMessage(); reply != nil {
+		if text := firstNonEmpty(
+			reply.GetBody().GetText(),
+			reply.GetNativeFlowResponseMessage().GetParamsJSON(),
+		); text != "" {
+			return text
+		}
+	}
+
+	// Polls read like a menu and were dropped for the same reason.
+	for _, poll := range []*waProto.PollCreationMessage{
+		msg.GetPollCreationMessage(),
+		msg.GetPollCreationMessageV2(),
+		msg.GetPollCreationMessageV3(),
+		msg.GetPollCreationMessageV5(),
+		msg.GetPollCreationMessageV6(),
+	} {
+		if poll == nil {
+			continue
+		}
+		var b textBuilder
+		b.add(poll.GetName())
+		for _, option := range poll.GetOptions() {
+			b.add(bulletFor(option.GetOptionName(), "", ""))
+		}
+		if text := b.String(); text != "" {
+			return text
+		}
+	}
+
+	// A clinic answering "endereço da unidade" replies with a pin or a vCard, so
+	// these two carry the answer the menu was navigated for.
+	if location := msg.GetLocationMessage(); location != nil {
+		var b textBuilder
+		b.add(location.GetName())
+		b.add(location.GetAddress())
+		b.add(fmt.Sprintf("%f, %f", location.GetDegreesLatitude(), location.GetDegreesLongitude()))
+		return b.String()
+	}
+	if contact := msg.GetContactMessage(); contact != nil {
+		var b textBuilder
+		b.add(contact.GetDisplayName())
+		b.add(contact.GetVcard())
+		if text := b.String(); text != "" {
+			return text
+		}
+	}
+
+	// Anything still unhandled is reported by unhandledMessageFields at the call site.
 	return ""
+}
+
+func firstNonEmpty(candidates ...string) string {
+	for _, candidate := range candidates {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func renderListMessage(list *waProto.ListMessage) string {
+	var b textBuilder
+	b.add(list.GetTitle())
+	b.add(list.GetDescription())
+	for _, section := range list.GetSections() {
+		b.add(section.GetTitle())
+		for _, row := range section.GetRows() {
+			b.add(bulletFor(row.GetTitle(), row.GetDescription(), row.GetRowID()))
+		}
+	}
+	b.add(list.GetButtonText())
+	b.add(list.GetFooterText())
+	return b.String()
+}
+
+func renderButtonsMessage(buttons *waProto.ButtonsMessage) string {
+	var b textBuilder
+	b.add(buttons.GetText())
+	b.add(buttons.GetContentText())
+	for _, button := range buttons.GetButtons() {
+		b.add(bulletFor(button.GetButtonText().GetDisplayText(), "", button.GetButtonID()))
+	}
+	b.add(buttons.GetFooterText())
+	return b.String()
+}
+
+func renderTemplateMessage(template *waProto.TemplateMessage, depth int) string {
+	hydrated := template.GetHydratedTemplate()
+	if hydrated == nil {
+		hydrated = template.GetHydratedFourRowTemplate()
+	}
+	if hydrated == nil {
+		// Newer templates carry an interactive message instead of a hydrated one.
+		return renderInteractiveMessage(template.GetInteractiveMessageTemplate())
+	}
+
+	var b textBuilder
+	b.add(hydrated.GetHydratedTitleText())
+	b.add(hydrated.GetHydratedContentText())
+	for _, button := range hydrated.GetHydratedButtons() {
+		switch {
+		case button.GetQuickReplyButton() != nil:
+			quickReply := button.GetQuickReplyButton()
+			b.add(bulletFor(quickReply.GetDisplayText(), "", quickReply.GetID()))
+		case button.GetUrlButton() != nil:
+			urlButton := button.GetUrlButton()
+			b.add(bulletFor(urlButton.GetDisplayText(), urlButton.GetURL(), ""))
+		case button.GetCallButton() != nil:
+			callButton := button.GetCallButton()
+			b.add(bulletFor(callButton.GetDisplayText(), callButton.GetPhoneNumber(), ""))
+		}
+	}
+	b.add(hydrated.GetHydratedFooterText())
+	return b.String()
+}
+
+func renderInteractiveMessage(interactive *waProto.InteractiveMessage) string {
+	if interactive == nil {
+		return ""
+	}
+
+	var b textBuilder
+	b.add(interactive.GetHeader().GetTitle())
+	b.add(interactive.GetHeader().GetSubtitle())
+	b.add(interactive.GetBody().GetText())
+	for _, button := range interactive.GetNativeFlowMessage().GetButtons() {
+		b.add(renderNativeFlowButton(button))
+	}
+	b.add(interactive.GetFooter().GetText())
+	return b.String()
+}
+
+// nativeFlowParams is the subset of a native flow button's JSON payload that
+// carries text a reader needs. The payload is a loose JSON blob whose shape
+// depends on the button name (quick_reply, cta_url, single_select), so every
+// field is optional and absent ones simply render as nothing.
+type nativeFlowParams struct {
+	DisplayText string `json:"display_text"`
+	ID          string `json:"id"`
+	URL         string `json:"url"`
+	Title       string `json:"title"`
+	Sections    []struct {
+		Title string `json:"title"`
+		Rows  []struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+			ID          string `json:"id"`
+		} `json:"rows"`
+	} `json:"sections"`
+}
+
+func renderNativeFlowButton(button *waProto.InteractiveMessage_NativeFlowMessage_NativeFlowButton) string {
+	raw := button.GetButtonParamsJSON()
+	if raw == "" {
+		return bulletFor(button.GetName(), "", "")
+	}
+
+	var params nativeFlowParams
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		// Better a raw payload in the history than a menu option that vanishes.
+		return bulletFor(button.GetName(), raw, "")
+	}
+
+	var b textBuilder
+	b.add(bulletFor(params.DisplayText, params.URL, params.ID))
+	b.add(params.Title)
+	for _, section := range params.Sections {
+		b.add(section.Title)
+		for _, row := range section.Rows {
+			b.add(bulletFor(row.Title, row.Description, row.ID))
+		}
+	}
+	if text := b.String(); text != "" {
+		return text
+	}
+	return bulletFor(button.GetName(), "", "")
+}
+
+// unhandledMessageFields names the protobuf fields actually set on a message, so
+// a message dropped for carrying no extractable text says in the log which type
+// still needs support instead of disappearing silently.
+func unhandledMessageFields(msg *waProto.Message) string {
+	if msg == nil {
+		return "<nil>"
+	}
+
+	var names []string
+	msg.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		names = append(names, string(field.Name()))
+		return true
+	})
+	if len(names) == 0 {
+		return "<empty>"
+	}
+	return strings.Join(names, ",")
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -466,8 +779,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media. The log names the protobuf fields
+	// that were set, so a message type we still cannot read is visible instead of
+	// vanishing the way interactive menus used to.
 	if content == "" && mediaType == "" {
+		logger.Debugf("Skipping message %s in %s: no extractable content (fields: %s)",
+			msg.Info.ID, chatJID, unhandledMessageFields(msg.Message))
 		return
 	}
 
@@ -824,12 +1141,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
-	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	// Set up logger. WHATSAPP_LOG_LEVEL=DEBUG turns on, among other things, the
+	// line naming the protobuf fields of a message dropped for having no
+	// extractable text — the way to find a message type we still cannot read.
+	logLevel := os.Getenv("WHATSAPP_LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "INFO"
+	}
+	logger := waLog.Stdout("Client", logLevel, true)
 	logger.Infof("Starting WhatsApp client...")
 
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := waLog.Stdout("Database", logLevel, true)
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -1349,15 +1672,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
-				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				// Extract text content. Shares extractTextContent with live
+				// messages so interactive menus are not dropped here either.
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1373,6 +1690,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
+					logger.Debugf("Skipping history message in %s: no extractable content (fields: %s)",
+						chatJID, unhandledMessageFields(msg.Message.Message))
 					continue
 				}
 
