@@ -332,15 +332,26 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
+        # Build base query. The last-message columns come from the JOIN below,
+        # which only exists when include_last_message is set: selecting them
+        # unconditionally made sqlite fail with "no such column", and the
+        # except clause turned that into an empty chat list.
+        last_message_columns = """
+                messages.content as last_message,
+                messages.sender as last_sender,
+                messages.is_from_me as last_is_from_me
+        """ if include_last_message else """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me
+        """
+
+        query_parts = [f"""
             SELECT 
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_message_columns}
             FROM chats
         """]
         
