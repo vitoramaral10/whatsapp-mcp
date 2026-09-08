@@ -356,9 +356,19 @@ def list_chats(
         """]
         
         if include_last_message:
+            # chats.last_message_time can name a message the bridge never
+            # stored -- it drops the types it cannot render -- so matching it
+            # against messages.timestamp left those chats with no last message
+            # at all. Take the newest message actually on file instead; the
+            # LIMIT 1 also keeps two messages sharing a timestamp from
+            # duplicating the chat row.
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
-                AND chats.last_message_time = messages.timestamp
+                LEFT JOIN messages ON messages.rowid = (
+                    SELECT m.rowid FROM messages m
+                    WHERE m.chat_jid = chats.jid
+                    ORDER BY m.timestamp DESC
+                    LIMIT 1
+                )
             """)
             
         where_clauses = []
