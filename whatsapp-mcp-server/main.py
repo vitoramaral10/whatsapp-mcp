@@ -1,7 +1,13 @@
+import base64
+import json
+import mimetypes
+import tempfile
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
+from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -39,7 +45,41 @@ def _host_visible_path(file_path: str) -> str:
         return file_path
     return MEDIA_HOST_PATH.rstrip("/") + file_path[len(MEDIA_CONTAINER_PATH):]
 
-mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
+
+def _container_path(file_path: str) -> str:
+    """Undo _host_visible_path, so send_* accepts the path download_media returned."""
+    host = MEDIA_HOST_PATH.rstrip("/")
+    if not host or not file_path.startswith(host + "/"):
+        return file_path
+    return MEDIA_CONTAINER_PATH + file_path[len(host):]
+
+
+# Clients rarely share this container's disk, so media also travels inline as
+# base64. Above this size download_media falls back to returning only the path.
+MEDIA_MAX_INLINE_BYTES = int(os.environ.get("WHATSAPP_MEDIA_MAX_INLINE_BYTES", str(8 * 1024 * 1024)))
+
+
+@contextmanager
+def _media_file(media_path: str, content_base64: str, filename: str):
+    """Yield a path the bridge can read: media_path, or the decoded upload in a temp dir.
+
+    The bridge picks the media type from the extension and uses the basename as the
+    document title, so the upload is written under its own filename.
+    """
+    if not content_base64:
+        yield _container_path(media_path)
+        return
+    name = os.path.basename(filename or "")
+    if "." not in name.strip("."):
+        raise ValueError("filename with an extension is required with content_base64")
+    data = base64.b64decode(content_base64, validate=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        yield path
+
+mcp =FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
 
 def _jsonable(value):
@@ -227,67 +267,90 @@ def send_message(
     }
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str = "", content_base64: str = "", filename: str = "") -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
+        media_path: Path to a file already on the WhatsApp server (e.g. one returned by download_media).
+                 Leave empty when sending content_base64.
+        content_base64: The file content, base64-encoded. Use this to send a file from the client side.
+        filename: Required with content_base64; its extension picks the media type and it is shown
+                 as the document name (e.g. "relatorio.pdf")
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    try:
+        with _media_file(media_path, content_base64, filename) as path:
+            success, status_message = whatsapp_send_file(recipient, path)
+    except ValueError as e:
+        success, status_message = False, f"Invalid file content: {e}"
     return {
         "success": success,
         "message": status_message
     }
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_audio_message(recipient: str, media_path: str = "", content_base64: str = "", filename: str = "") -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+        media_path: Path to an audio file already on the WhatsApp server (will be converted to Opus .ogg
+                 if it's not a .ogg file). Leave empty when sending content_base64.
+        content_base64: The audio content, base64-encoded. Use this to send audio from the client side.
+        filename: Required with content_base64; its extension tells the format (e.g. "nota.mp3")
+
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+    try:
+        with _media_file(media_path, content_base64, filename) as path:
+            success, status_message = whatsapp_audio_voice_message(recipient, path)
+    except ValueError as e:
+        success, status_message = False, f"Invalid file content: {e}"
     return {
         "success": success,
         "message": status_message
     }
 
-@mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
-    
+@mcp.tool(structured_output=False)
+def download_media(message_id: str, chat_jid: str) -> list:
+    """Download media from a WhatsApp message and return its content.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
-        A dictionary containing success status, a status message, and the file path if successful
+        A JSON text block with success status, message, file_path, mime_type and size_bytes,
+        followed by the file itself: an image block for pictures, an embedded resource
+        (base64 blob) for everything else. Files over the inline limit come back as path only.
     """
     file_path = whatsapp_download_media(message_id, chat_jid)
-    
-    if file_path:
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": _host_visible_path(file_path)
-        }
+    if not file_path:
+        return [TextContent(type="text", text=json.dumps({"success": False, "message": "Failed to download media"}))]
+
+    host_path = _host_visible_path(file_path)
+    mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    size = os.path.getsize(file_path)
+    info = {"success": True, "message": "Media downloaded successfully",
+            "file_path": host_path, "mime_type": mime, "size_bytes": size}
+    if size > MEDIA_MAX_INLINE_BYTES:
+        info["message"] += f"; over the {MEDIA_MAX_INLINE_BYTES}-byte inline limit, so only the path is returned"
+        return [TextContent(type="text", text=json.dumps(info))]
+
+    with open(file_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode("ascii")
+    if mime.startswith("image/"):
+        content = ImageContent(type="image", data=data, mimeType=mime)
     else:
-        return {
-            "success": False,
-            "message": "Failed to download media"
-        }
+        content = EmbeddedResource(type="resource", resource=BlobResourceContents(
+            uri=f"file://{host_path}", mimeType=mime, blob=data))
+    return [TextContent(type="text", text=json.dumps(info)), content]
 
 if __name__ == "__main__":
     # Initialize and run the server

@@ -16,8 +16,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Upper bound matters: the server code is MCP SDK v1 (FastMCP), which 2.x renamed to
-# MCPServer. Lower bound is where streamable-http landed, past the 1.6.0 the repo pins.
-RUN pip install --no-cache-dir "mcp[cli]>=1.9.0,<2" "httpx>=0.28.1" "requests>=2.32.3"
+# MCPServer. Lower bound is where streamable-http landed, past the 1.6.0 the repo pins; 1.10 adds structured_output=False.
+RUN pip install --no-cache-dir "mcp[cli]>=1.10.0,<2" "httpx>=0.28.1" "requests>=2.32.3"
 
 WORKDIR /app
 COPY --from=bridge-build /out/whatsapp-bridge /app/whatsapp-bridge/whatsapp-bridge
