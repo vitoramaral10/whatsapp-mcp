@@ -33,5 +33,26 @@ class MediaFileTest(unittest.TestCase):
                     pass
 
 
+class TranscriptionTest(unittest.TestCase):
+    def test_slow_run_is_pending_then_cached(self):
+        import tempfile, threading
+        from unittest import mock
+        release = threading.Event()
+
+        def slow(path, url, timeout):
+            release.wait(5)
+            return "olá"
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(main.audio, "transcribe", slow), \
+                mock.patch.object(main, "WHISPER_WAIT_S", 0.05):
+            ogg = os.path.join(tmp, "a.ogg")
+            self.assertIn("transcription_pending", main._transcription(ogg))
+            release.set()
+            main._transcriber.submit(lambda: None).result()  # drain the queue
+            self.assertEqual(main._transcription(ogg), {"transcription": "olá"})
+            self.assertFalse(main._transcribing)
+
+
 if __name__ == "__main__":
     unittest.main()

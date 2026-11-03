@@ -2,7 +2,10 @@ import base64
 import json
 import mimetypes
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import contextmanager
+
+import audio
 from typing import List, Dict, Any, Optional
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -57,6 +60,48 @@ def _container_path(file_path: str) -> str:
 # Clients rarely share this container's disk, so media also travels inline as
 # base64. Above this size download_media falls back to returning only the path.
 MEDIA_MAX_INLINE_BYTES = int(os.environ.get("WHATSAPP_MEDIA_MAX_INLINE_BYTES", str(8 * 1024 * 1024)))
+
+# Clients cannot listen to audio, so download_media adds a transcript when a
+# whisper.cpp server is configured. On a small GPU one run can outlast the
+# gateway's deadline, so it runs in the background and is cached next to the
+# file: the call waits WHISPER_WAIT_S, and a later call picks up the text.
+WHISPER_URL = os.environ.get("WHISPER_URL", "")
+# The slim image has no /etc/mime.types, so voice notes would read as octet-stream.
+mimetypes.add_type("audio/ogg", ".ogg")
+WHISPER_WAIT_S = float(os.environ.get("WHISPER_WAIT_S", "10"))
+WHISPER_TIMEOUT_S = float(os.environ.get("WHISPER_TIMEOUT_S", "180"))
+# whisper-server handles one request at a time anyway.
+_transcriber = ThreadPoolExecutor(max_workers=1)
+_transcribing: Dict[str, Future] = {}
+
+
+def _transcribe_to_cache(file_path: str) -> str:
+    try:
+        text = audio.transcribe(file_path, WHISPER_URL, WHISPER_TIMEOUT_S)
+        with open(file_path + ".txt.tmp", "w") as f:
+            f.write(text)
+        os.replace(file_path + ".txt.tmp", file_path + ".txt")
+        return text
+    finally:
+        _transcribing.pop(file_path, None)
+
+
+def _transcription(file_path: str) -> Dict[str, str]:
+    """transcription, transcription_pending or transcription_error for download_media."""
+    try:
+        with open(file_path + ".txt") as f:
+            return {"transcription": f.read()}
+    except FileNotFoundError:
+        pass
+    future = _transcribing.get(file_path)
+    if future is None:
+        future = _transcribing[file_path] = _transcriber.submit(_transcribe_to_cache, file_path)
+    try:
+        return {"transcription": future.result(timeout=WHISPER_WAIT_S)}
+    except FutureTimeout:
+        return {"transcription_pending": "Still transcribing; call download_media again in about 30 seconds"}
+    except RuntimeError as e:
+        return {"transcription_error": str(e)}
 
 
 @contextmanager
@@ -326,8 +371,8 @@ def download_media(message_id: str, chat_jid: str) -> list:
         chat_jid: The JID of the chat containing the message
 
     Returns:
-        A JSON text block with success status, message, file_path, mime_type and size_bytes,
-        followed by the file itself: an image block for pictures, an embedded resource
+        A JSON text block with success status, message, file_path, mime_type and size_bytes
+        (plus transcription, transcription_pending or transcription_error for audio), followed by the file itself: an image block for pictures, an embedded resource
         (base64 blob) for everything else. Files over the inline limit come back as path only.
     """
     file_path = whatsapp_download_media(message_id, chat_jid)
@@ -339,6 +384,8 @@ def download_media(message_id: str, chat_jid: str) -> list:
     size = os.path.getsize(file_path)
     info = {"success": True, "message": "Media downloaded successfully",
             "file_path": host_path, "mime_type": mime, "size_bytes": size}
+    if mime.startswith("audio/") and WHISPER_URL:
+        info.update(_transcription(file_path))
     if size > MEDIA_MAX_INLINE_BYTES:
         info["message"] += f"; over the {MEDIA_MAX_INLINE_BYTES}-byte inline limit, so only the path is returned"
         return [TextContent(type="text", text=json.dumps(info))]

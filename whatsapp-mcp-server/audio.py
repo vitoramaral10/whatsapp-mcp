@@ -92,6 +92,39 @@ def convert_to_opus_ogg_temp(input_file, bitrate="32k", sample_rate=24000):
         raise e
 
 
+def transcribe(input_file, server_url, timeout=12.0):
+    """
+    Transcribe an audio file with a whisper.cpp server (POST /inference).
+
+    whisper-server only reads WAV unless built with --convert, so the audio is
+    converted here to 16 kHz mono first.
+
+    Returns:
+        str: The transcribed text
+
+    Raises:
+        RuntimeError: If the conversion or the server call fails
+    """
+    import requests
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, "audio.wav")
+        try:
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-i", input_file, "-ar", "16000", "-ac", "1", "-y", wav],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to convert audio to wav: {e.stderr}")
+        try:
+            with open(wav, "rb") as f:
+                response = requests.post(server_url.rstrip("/") + "/inference",
+                                         files={"file": ("audio.wav", f, "audio/wav")},
+                                         data={"response_format": "json"}, timeout=timeout)
+            response.raise_for_status()
+            return response.json()["text"].strip()
+        except (requests.RequestException, ValueError, KeyError) as e:
+            raise RuntimeError(f"Transcription failed: {e}")
+
+
 if __name__ == "__main__":
     # Example usage
     import sys
