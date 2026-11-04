@@ -93,6 +93,16 @@ impl Wa {
                 self.save_contact(&jid, ContactField::FullName, c.action.full_name.as_deref().unwrap_or(""));
                 self.save_contact(&jid, ContactField::FirstName, c.action.first_name.as_deref().unwrap_or(""));
             }
+            // Reading on the phone: live receipts, and app-state marks (also
+            // replayed in full after pairing).
+            Event::Receipt(r) if r.r#type == whatsapp_rust::wacore::types::presence::ReceiptType::ReadSelf => {
+                let chat = self.canonical(&r.source.chat).await;
+                let _ = self.store.mark_read(&chat.to_string(), r.timestamp);
+            }
+            Event::MarkChatAsReadUpdate(u) if u.action.read == Some(true) => {
+                let chat = self.canonical(&u.jid).await;
+                let _ = self.store.mark_read(&chat.to_string(), u.timestamp);
+            }
             Event::LoggedOut(l) => warn!("device logged out ({:?}); restart and scan the QR code again", l.reason),
             Event::PairSuccess(_) => info!("paired successfully"),
             _ => {}
@@ -356,7 +366,7 @@ impl Wa {
         }) {
             warn!("failed to store sent message: {e:#}");
         }
-        Ok(format!("Message sent to {recipient}"))
+        Ok(format!("Message sent to {recipient} (message ID: {})", sent.message_id))
     }
 
     /// Rewrites the text of a message you sent; WhatsApp accepts this only in
@@ -377,13 +387,66 @@ impl Wa {
         Ok(format!("Message {id} deleted"))
     }
 
-    /// The client, the JID to send to and the stored chat of a message of
-    /// ours: WhatsApp would refuse the edit of anyone else's message anyway.
-    async fn own_message(&self, recipient: &str, id: &str, text_only: bool) -> Result<(&Arc<Client>, Jid, String)> {
+    /// Reacts to a message of the chat; an empty emoji takes the reaction back.
+    pub async fn react(&self, recipient: &str, id: &str, emoji: &str) -> Result<String> {
+        let client = self.connected()?;
+        let to = parse_recipient(recipient)?;
+        let chat = self.canonical(&to).await.to_string();
+        let (_, from_me, sender) = self.store.media(id, &chat)?.ok_or_else(|| anyhow!("message {id} is not in this chat"))?;
+        let key = wa::MessageKey {
+            remote_jid: Some(to.to_string()),
+            from_me: Some(from_me),
+            id: Some(id.to_string()),
+            participant: ((to.server == Server::Group) && !from_me).then(|| format!("{sender}@s.whatsapp.net")),
+            ..Default::default()
+        };
+        let sent = client.send_reaction(to, key, emoji).await.map_err(|e| anyhow!("Error sending reaction: {e}"))?;
+        if !emoji.is_empty() {
+            let own = client.pn().map(|j| j.user.to_string()).unwrap_or_default();
+            let change = extract::Change::React { id: id.to_string(), emoji: emoji.to_string() };
+            self.apply(change, &sent.message_id, &chat, &own, Utc::now(), true)?;
+        }
+        Ok(format!("Reacted {emoji} to {id}"))
+    }
+
+    /// Marks every unread message of the chat as read: blue ticks for the
+    /// senders, and the chat read on your other devices.
+    pub async fn mark_read(&self, recipient: &str) -> Result<String> {
+        let client = self.connected()?;
+        let to = parse_recipient(recipient)?;
+        let chat = self.canonical(&to).await.to_string();
+        let unread = self.store.unread_messages(&chat)?;
+        let mut by_sender: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (id, sender) in &unread {
+            by_sender.entry(if to.server == Server::Group { sender.as_str() } else { "" }).or_default().push(id);
+        }
+        for (sender, ids) in by_sender {
+            let sender = (!sender.is_empty()).then(|| Jid::new(sender, Server::Pn));
+            client.mark_as_read(&to, sender.as_ref(), &ids).await.map_err(|e| anyhow!("Error sending read receipts: {e:#}"))?;
+        }
+        if let Err(e) = client.chat_actions().mark_chat_as_read(&to, true, None).await {
+            warn!("chat {chat} read on the phone failed: {e:?}");
+        }
+        self.store.mark_read(&chat, Utc::now())?;
+        Ok(format!("{} messages marked as read in {recipient}", unread.len()))
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.client().is_ok_and(|c| c.is_connected())
+    }
+
+    fn connected(&self) -> Result<&Arc<Client>> {
         let client = self.client()?;
         if !client.is_connected() {
             bail!("Not connected to WhatsApp");
         }
+        Ok(client)
+    }
+
+    /// The client, the JID to send to and the stored chat of a message of
+    /// ours: WhatsApp would refuse the edit of anyone else's message anyway.
+    async fn own_message(&self, recipient: &str, id: &str, text_only: bool) -> Result<(&Arc<Client>, Jid, String)> {
+        let client = self.connected()?;
         let to = parse_recipient(recipient)?;
         let chat = self.canonical(&to).await.to_string();
         let (media, from_me, _) = self.store.media(id, &chat)?.ok_or_else(|| anyhow!("message {id} is not in this chat"))?;
@@ -536,7 +599,8 @@ impl Wa {
     }
 
     async fn reupload(&self, message_id: &str, chat_jid: &str, m: &Media, from_me: bool, sender: &str) -> Result<String> {
-        use whatsapp_rust::{MediaReuploadRequest, MediaRetryResult};
+        use whatsapp_rust::wacore::media_retry::{build_media_retry_receipt, encrypt_media_retry_receipt, parse_media_retry_notification};
+        use whatsapp_rust::{MediaRetryResult, NodeFilter};
         if m.media_key.is_empty() {
             bail!("no media key to request a re-upload with");
         }
@@ -550,19 +614,29 @@ impl Wa {
                 chats.insert(0, Jid::new(&lid, Server::Lid));
             }
         }
+        let client = self.client()?;
+        // shortcut: whatsapp-rust 0.7.0 media_reupload() addresses the receipt to
+        // our own device (user:N@...), so the phone never sees it; whatsmeow and
+        // the crate's own history-sync receipt use the bare JID. Back to
+        // media_reupload() once the crate fixes it.
+        let own = client.pn().ok_or_else(|| anyhow!("not logged in"))?.to_non_ad();
+        let (ciphertext, iv) = encrypt_media_retry_receipt(&m.media_key, message_id)?;
         let mut last = anyhow!("no address to ask");
         for chat in &chats {
-            let req = MediaReuploadRequest {
-                msg_id: message_id,
-                chat_jid: chat,
-                media_key: &m.media_key,
-                is_from_me: from_me,
-                participant: participant.as_ref(),
+            let waiter = client.wait_for_node(NodeFilter::tag("notification").attr("type", "mediaretry").attr("id", message_id));
+            let receipt = build_media_retry_receipt(&own, message_id, chat, from_me, participant.as_ref(), &ciphertext, &iv);
+            client.send_node(receipt).await.map_err(|e| anyhow!("media re-upload request failed: {e}"))?;
+            let node = match tokio::time::timeout(std::time::Duration::from_secs(30), waiter).await {
+                Ok(Ok(node)) => node,
+                Ok(Err(_)) => bail!("media retry waiter cancelled"),
+                Err(_) => {
+                    last = anyhow!("media re-upload via {chat} failed: the phone did not answer in 30 s");
+                    continue;
+                }
             };
-            match self.client()?.media_reupload().request(&req).await {
-                Ok(MediaRetryResult::Success { direct_path }) => return Ok(direct_path),
-                Ok(other) => bail!("media re-upload refused: {other:?}"),
-                Err(e) => last = anyhow!("media re-upload via {chat} failed: {e}"),
+            match parse_media_retry_notification(&node.get(), &m.media_key)? {
+                MediaRetryResult::Success { direct_path } => return Ok(direct_path),
+                other => bail!("media re-upload refused: {other:?}"),
             }
         }
         Err(last)
@@ -591,7 +665,6 @@ impl Wa {
     }
 }
 
-/// JIDs for every "@<phone number>" in the text.
 fn parse_recipient(recipient: &str) -> Result<Jid> {
     if recipient.contains('@') {
         recipient.parse().map_err(|e| anyhow!("Error parsing JID: {e:?}"))
@@ -600,6 +673,7 @@ fn parse_recipient(recipient: &str) -> Result<Jid> {
     }
 }
 
+/// JIDs for every "@<phone number>" in the text.
 fn mentions(text: &str) -> Vec<String> {
     text.split('@')
         .skip(1)

@@ -86,6 +86,9 @@ async fn run() -> Result<()> {
             Duration::from_secs_f64(env("WHISPER_TIMEOUT_S", "180").parse().unwrap_or(180.0)),
         )
     });
+    if let Some(t) = &transcriber {
+        tokio::spawn(transcribe_incoming(Arc::clone(t), Arc::clone(&wa), Arc::clone(&store)));
+    }
     let embed_url = env("EMBED_URL", "");
     let embedder = (!embed_url.is_empty()).then(|| embed::Embedder::new(embed_url, env("EMBED_MODEL", "bge-m3")));
     if let Some(e) = &embedder {
@@ -168,6 +171,40 @@ struct SendRequest {
 }
 
 /// The Go bridge's /api/send, kept for services that call it directly.
+/// Transcribes voice notes of the last days as they come, one at a time, so
+/// the searches find what was said without anyone opening them. Audio the CDN
+/// no longer has is tried once per run.
+async fn transcribe_incoming(t: Arc<transcribe::Transcriber>, wa: Arc<wa::Wa>, store: Arc<store::Store>) {
+    let mut failed = std::collections::HashSet::new();
+    loop {
+        let since = chrono::Utc::now() - chrono::Duration::days(3);
+        if !wa.is_connected() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        let todo: Vec<_> = store.untranscribed(since, 50).unwrap_or_default().into_iter().filter(|m| !failed.contains(m)).collect();
+        for (id, chat) in todo {
+            let outcome = match wa.download(&id, &chat).await {
+                Ok((_, path)) => loop {
+                    match t.transcription(&id, &chat, &path).await {
+                        transcribe::Outcome::Pending => continue,
+                        done => break done,
+                    }
+                },
+                Err(e) => transcribe::Outcome::Error(format!("{e:#}")),
+            };
+            if let transcribe::Outcome::Error(e) = outcome {
+                if !wa.is_connected() {
+                    break; // not the audio's fault: try it again once back online
+                }
+                log::warn!("auto transcription of {id} failed: {e}");
+                failed.insert((id, chat));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
 async fn api_send(State(ctx): State<Arc<mcp::Ctx>>, Json(req): Json<SendRequest>) -> (StatusCode, Json<Value>) {
     if req.recipient.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Recipient is required"})));

@@ -47,10 +47,10 @@ printed 8-character code under *Link with phone number* instead.
 | `WHATSAPP_SEND_DIRS` | store dir | `:`-separated directories `send_file` and `/api/send` may read from; databases and files in the store root are always refused |
 | `WHATSAPP_MEDIA_HOST_PATH` | — | Host side of the store bind mount, so returned paths open on the host |
 | `WHATSAPP_MEDIA_MAX_INLINE_BYTES` | `8388608` | Larger media come back as a path only |
-| `WHATSAPP_READ_ONLY` | — | `true` hides the send, edit and delete tools from MCP clients (the REST API still sends) |
+| `WHATSAPP_READ_ONLY` | — | `true` hides every tool that writes (send, edit, delete, react, mark read) from MCP clients (the REST API still sends) |
 | `WHATSAPP_ALLOWED_CHATS` | — | `,`-separated JIDs or phone numbers: the MCP tools read, download and send only in these chats; the history still records every chat, and the REST API, meant for services on a private network, is not limited |
 | `EMBED_URL` / `EMBED_MODEL` | — / `bge-m3` | OpenAI-compatible `/v1/embeddings` server (e.g. `llama-server --embedding`); enables the semantic half of `search_messages` |
-| `WHISPER_URL` | — | whisper.cpp server; voice notes get a transcript, saved as the text of the message (`[transcription] ` prefix) so `list_messages` and `search_messages` find it |
+| `WHISPER_URL` | — | whisper.cpp server; voice notes of the last 3 days are transcribed as they arrive, and older ones when downloaded; the transcript is saved as the text of the message (`[transcription] ` prefix) so `list_messages` and `search_messages` find it |
 | `WHISPER_WAIT_S` / `WHISPER_TIMEOUT_S` | `10` / `180` | How long a call waits for the transcript / per-run limit |
 | `WHATSAPP_LOG_LEVEL` | `info` | Log level of the WhatsApp library |
 
@@ -64,16 +64,25 @@ over, so the device has to be paired again.
 - **search_messages**: best matches first, by meaning (embeddings) and by words (SQLite FTS5),
   merged by reciprocal rank; full-text only when no embedding server is set
 - **list_messages**: messages with filters (date, sender, chat, words via FTS5) and surrounding context
-- **list_chats**, **get_chat**, **get_direct_chat_by_contact**, **get_contact_chats**
+- **list_chats** (`unread_only`), **get_chat**, **get_direct_chat_by_contact**, **get_contact_chats**
 - **get_last_interaction**, **get_message_context**
 - **send_message**: text to a phone number or JID; `reply_to_message_id` quotes a message, and
   every `@<phone number>` in the text becomes a mention
 - **send_file**: image, video or document, from a path in the send dirs or `content_base64` + `filename`
 - **send_audio_message**: any decodable audio sent as an Opus voice note
+- **get_digest**: a period chat by chat, busiest first, with message and unread counts and the
+  latest messages in order, for "what happened today" summaries
+- **send_reaction**: an emoji on a message (empty removes it)
+- **mark_chat_read**: read receipts for the unread messages and the chat read on the phone
 - **edit_message**, **delete_message**: rewrite (text only, within WhatsApp's ~15 min window)
   or delete for everyone a message you sent
 - **download_media**: the file itself (image block or embedded resource) plus metadata; voice
   notes also carry `transcription`, or `transcription_pending` while whisper is still running
+
+Every listed message carries its `Message ID` and `Chat JID`, and the send tools return the new
+message's ID: those are what replies, edits, deletions and reactions take. Unread counts start
+after the later of your own last message and the last read your phone reported; at the first
+start with this version everything before counts as read.
 
 Edits rewrite the stored message (`[edited] ` prefix), deletions keep the text under a
 `[deleted] ` prefix, and reactions are stored as their own line quoting the message. Media whose

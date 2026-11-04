@@ -28,6 +28,7 @@ fn is_placeholder(name: &str) -> bool {
 pub const EDITED: &str = "[edited] ";
 pub const DELETED: &str = "[deleted] ";
 pub const TRANSCRIBED: &str = "[transcription] ";
+const MIN_SEMANTIC_CHARS: usize = 15;
 
 pub fn format_ts(ts: DateTime<Utc>) -> String {
     ts.format(TS_FORMAT).to_string()
@@ -75,6 +76,8 @@ pub struct Chat {
     pub last_message: Option<String>,
     pub last_sender: Option<String>,
     pub last_is_from_me: Option<bool>,
+    /// Messages from others since you last read or wrote in the chat.
+    pub unread_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -138,11 +141,25 @@ fn row_chat(row: &rusqlite::Row) -> rusqlite::Result<Chat> {
         last_message: row.get(3)?,
         last_sender: row.get(4)?,
         last_is_from_me: row.get(5)?,
+        unread_count: row.get(6)?,
     })
 }
 
 /// Newest message actually on file, not the one chats.last_message_time names:
 /// that can be a message the bridge dropped as unreadable.
+/// Unread messages `u` of chat `c`: from others, after the latest of the read
+/// the phone reported, your own last message and the cut-off (`*`) set when
+/// unread tracking began. Reactions do not count.
+macro_rules! unread_where {
+    () => {
+        "u.chat_jid = c.jid AND NOT u.is_from_me AND COALESCE(u.content, '') NOT LIKE '[reacted %'
+         AND u.timestamp > MAX(COALESCE((SELECT read_at FROM chat_reads r WHERE r.jid = c.jid), ''),
+                               COALESCE((SELECT read_at FROM chat_reads r WHERE r.jid = '*'), ''),
+                               COALESCE((SELECT MAX(o.timestamp) FROM messages o WHERE o.chat_jid = c.jid AND o.is_from_me), ''))"
+    };
+}
+const UNREAD: &str = concat!("(SELECT COUNT(*) FROM messages u WHERE ", unread_where!(), ")");
+
 const LAST_MESSAGE_JOIN: &str = "LEFT JOIN messages m ON m.rowid = (
         SELECT x.rowid FROM messages x WHERE x.chat_jid = c.jid
         ORDER BY x.timestamp DESC LIMIT 1)";
@@ -247,6 +264,11 @@ impl Store {
                  embedding BLOB NOT NULL
              );",
         )?;
+        // When you last read each chat. Row '*' is when tracking began: older
+        // messages, history synced later included, count as read, or every old
+        // group would show its whole history as unread.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS chat_reads (jid TEXT PRIMARY KEY, read_at TIMESTAMP NOT NULL);")?;
+        db.execute("INSERT OR IGNORE INTO chat_reads VALUES ('*', ?1)", [format_ts(Utc::now())])?;
         if !has_fts {
             db.execute("INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')", [])?;
         }
@@ -355,15 +377,17 @@ impl Store {
         }
         self.conn().execute(
             // An upsert, not REPLACE: the row keeps its rowid, which the
-            // full-text index and the vectors are keyed by. A transcript is
-            // never lost to the same audio arriving again.
+            // full-text index and the vectors are keyed by. A transcript, an
+            // edit or a deletion is never undone by the original arriving again.
             "INSERT INTO messages
              (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url,
               media_key, file_sha256, file_enc_sha256, file_length, direct_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id, chat_jid) DO UPDATE SET
                sender = excluded.sender,
-               content = CASE WHEN instr(messages.content, '[transcription] ') > 0 THEN messages.content ELSE excluded.content END,
+               content = CASE WHEN instr(messages.content, '[transcription] ') > 0
+                                   OR substr(messages.content, 1, 9) = '[edited] ' OR substr(messages.content, 1, 10) = '[deleted] '
+                              THEN messages.content ELSE excluded.content END,
                timestamp = excluded.timestamp,
                is_from_me = excluded.is_from_me, media_type = excluded.media_type, filename = excluded.filename,
                url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
@@ -577,9 +601,58 @@ impl Store {
         Ok(())
     }
 
+    /// (id, chat) of voice notes since `since` with no transcript yet, newest first.
+    pub fn untranscribed(&self, since: DateTime<Utc>, n: u32) -> Result<Vec<(String, String)>> {
+        let db = self.conn();
+        let mut stmt = db.prepare(
+            "SELECT id, chat_jid FROM messages WHERE media_type = 'audio' AND timestamp > ?1
+               AND instr(COALESCE(content, ''), ?2) = 0 ORDER BY timestamp DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![format_ts(since), TRANSCRIBED, n], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn transcription(&self, id: &str, chat_jid: &str) -> Option<String> {
         let content = self.message_content(id, chat_jid)?;
         content.find(TRANSCRIBED).map(|i| content[i + TRANSCRIBED.len()..].to_string())
+    }
+
+    /// Moves the read mark of a chat forward to `at`; never back.
+    pub fn mark_read(&self, jid: &str, at: DateTime<Utc>) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO chat_reads (jid, read_at) VALUES (?1, ?2)
+             ON CONFLICT(jid) DO UPDATE SET read_at = MAX(read_at, excluded.read_at)",
+            params![jid, format_ts(at)],
+        )?;
+        Ok(())
+    }
+
+    /// (id, sender) of the unread messages of a chat, oldest first, for read receipts.
+    pub fn unread_messages(&self, jid: &str) -> Result<Vec<(String, String)>> {
+        let db = self.reads();
+        let mut stmt = db.prepare(&format!(
+            "SELECT u.id, u.sender FROM messages u, (SELECT ?1 AS jid) c WHERE {} ORDER BY u.timestamp",
+            unread_where!()
+        ))?;
+        let rows = stmt.query_map([jid], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Chats with messages in the window, busiest first: (chat, messages in the window).
+    pub fn active_chats(&self, after: DateTime<Utc>, before: Option<DateTime<Utc>>, limit: u32) -> Result<Vec<(Chat, i64)>> {
+        let db = self.reads();
+        let mut stmt = db.prepare(&format!(
+            "SELECT c.jid, c.name, c.last_message_time, NULL, NULL, NULL, {UNREAD}, n FROM chats c
+             JOIN (SELECT chat_jid, COUNT(*) AS n FROM messages WHERE timestamp > ?1 AND timestamp < ?2 AND chat_jid <> 'status@broadcast' GROUP BY chat_jid) a
+               ON a.chat_jid = c.jid
+             ORDER BY n DESC LIMIT ?3"
+        ))?;
+        // Not a bare number: the TIMESTAMP column would compare it as one.
+        let before = before.map(format_ts).unwrap_or_else(|| "9999-12-31".into());
+        let rows = stmt
+            .query_map(params![format_ts(after), before, limit], |r| Ok((row_chat(r)?, r.get(7)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// (is_from_me, sender, content) of a message, to quote it in a reply.
@@ -669,8 +742,10 @@ impl Store {
         }
         if let Some(q) = qvec {
             let mut stmt = db.prepare(&format!(
+                // A reply as short as "when?" sits near any question and buries
+                // the real matches; words alone still find it.
                 "SELECT message_vec.rowid, message_vec.embedding FROM message_vec
-                 JOIN messages ON messages.rowid = message_vec.rowid WHERE {filter}"
+                 JOIN messages ON messages.rowid = message_vec.rowid WHERE length(messages.content) >= {MIN_SEMANTIC_CHARS} AND {filter}"
             ))?;
             let mut best: Vec<(f32, i64)> = stmt
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| Ok((dot(&r.get::<_, Vec<u8>>(1)?, q), r.get(0)?)))?
@@ -772,13 +847,13 @@ impl Store {
         Ok(Some(MessageContext { message: target, before, after }))
     }
 
-    pub fn list_chats(&self, query: Option<&str>, limit: u32, page: u32, last: bool, by_name: bool) -> Result<Vec<Chat>> {
+    pub fn list_chats(&self, query: Option<&str>, limit: u32, page: u32, last: bool, by_name: bool, unread_only: bool) -> Result<Vec<Chat>> {
         let cols = if last {
             "m.content, m.sender, m.is_from_me"
         } else {
             "NULL, NULL, NULL"
         };
-        let mut sql = format!("SELECT c.jid, c.name, c.last_message_time, {cols} FROM chats c ");
+        let mut sql = format!("SELECT * FROM (SELECT c.jid, c.name, c.last_message_time, {cols}, {UNREAD} AS unread FROM chats c ");
         if last {
             sql.push_str(LAST_MESSAGE_JOIN);
         }
@@ -787,7 +862,8 @@ impl Store {
             sql.push_str(" WHERE (LOWER(c.name) LIKE LOWER(?1) OR c.jid LIKE ?1)");
             args.push(format!("%{q}%"));
         }
-        sql.push_str(if by_name { " ORDER BY c.name" } else { " ORDER BY c.last_message_time DESC" });
+        sql.push_str(if unread_only { ") WHERE unread > 0" } else { ")" });
+        sql.push_str(if by_name { " ORDER BY name" } else { " ORDER BY last_message_time DESC" });
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, page as u64 * limit as u64));
         let db = self.reads();
         let mut stmt = db.prepare(&sql)?;
@@ -799,9 +875,9 @@ impl Store {
 
     pub fn get_chat(&self, jid: &str, last: bool) -> Result<Option<Chat>> {
         let sql = if last {
-            format!("SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me FROM chats c {LAST_MESSAGE_JOIN} WHERE c.jid = ?1")
+            format!("SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me, {UNREAD} FROM chats c {LAST_MESSAGE_JOIN} WHERE c.jid = ?1")
         } else {
-            "SELECT c.jid, c.name, c.last_message_time, NULL, NULL, NULL FROM chats c WHERE c.jid = ?1".into()
+            format!("SELECT c.jid, c.name, c.last_message_time, NULL, NULL, NULL, {UNREAD} FROM chats c WHERE c.jid = ?1")
         };
         Ok(self.reads().query_row(&sql, [jid], row_chat).optional()?)
     }
@@ -811,7 +887,7 @@ impl Store {
             .reads()
             .query_row(
                 &format!(
-                    "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me FROM chats c
+                    "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me, {UNREAD} FROM chats c
                      {LAST_MESSAGE_JOIN} WHERE c.jid LIKE ?1 AND c.jid NOT LIKE '%@g.us' LIMIT 1"
                 ),
                 [format!("%{phone}%")],
@@ -823,7 +899,7 @@ impl Store {
     pub fn contact_chats(&self, jid: &str, limit: u32, page: u32) -> Result<Vec<Chat>> {
         let db = self.reads();
         let mut stmt = db.prepare(&format!(
-            "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me FROM chats c
+            "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me, {UNREAD} FROM chats c
              {LAST_MESSAGE_JOIN}
              WHERE c.jid = ?1 OR EXISTS (SELECT 1 FROM messages s WHERE s.chat_jid = c.jid AND s.sender = ?1)
              ORDER BY c.last_message_time DESC LIMIT ?2 OFFSET ?3"
@@ -958,9 +1034,10 @@ pub fn format_message(store: &Store, m: &Message, show_chat: bool) -> String {
         (Some(name), true) => format!("[{ts}] Chat: {name} "),
         _ => format!("[{ts}] "),
     };
+    // The ID is what reply_to_message_id, edit_message and delete_message take.
     let prefix = match &m.media_type {
         Some(kind) => format!("[{kind} - Message ID: {} - Chat JID: {}] ", m.id, m.chat_jid),
-        None => String::new(),
+        None => format!("[Message ID: {} - Chat JID: {}] ", m.id, m.chat_jid),
     };
     let from = if m.is_from_me { "Me".to_string() } else { store.sender_name(&m.sender) };
     out.push_str(&format!("From: {from}: {prefix}{}\n", m.content));
@@ -1007,6 +1084,9 @@ mod tests {
         let msgs = s.list_messages(&MessageFilter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(format_message(&s, &msgs[0], true), "[2026-01-02 03:04:05] Chat: Ana From: Ana: [image - Message ID: ID1 - Chat JID: 55@s.whatsapp.net] oi\n");
+        s.store_message("ID3", "55@s.whatsapp.net", "55", "tchau", t, false, &Media::default()).unwrap();
+        let text = s.list_messages(&MessageFilter { query: Some("tchau".into()), limit: 1, ..Default::default() }).unwrap();
+        assert!(format_message(&s, &text[0], false).contains("[Message ID: ID3 - Chat JID: 55@s.whatsapp.net] tchau"));
     }
 
     #[test]
@@ -1021,6 +1101,8 @@ mod tests {
         assert!(!s.revoke_message("A", "55@s.whatsapp.net").unwrap());
         assert_eq!(s.message_content("A", "55@s.whatsapp.net").as_deref(), Some("[deleted] [edited] olá"));
         assert!(!s.edit_message("missing", "55@s.whatsapp.net", "x").unwrap());
+        s.store_message("A", "55@s.whatsapp.net", "55", "oi", t, false, &Media::default()).unwrap();
+        assert_eq!(s.message_content("A", "55@s.whatsapp.net").as_deref(), Some("[deleted] [edited] olá"));
     }
 
     #[test]
@@ -1095,6 +1177,48 @@ mod tests {
     }
 
     #[test]
+    fn short_replies_are_found_by_words_but_not_by_meaning() {
+        let (_d, s) = temp_store();
+        chat_with(&s, "55@s.whatsapp.net", &[("A", "Quando ?"), ("B", "que dia eles vão viajar?")]);
+        let rows = s.unembedded(10).unwrap();
+        s.put_vectors(&rows.iter().map(|(r, _)| (*r, vec![1.0_f32])).collect::<Vec<_>>()).unwrap();
+        let f = MessageFilter { limit: 5, ..Default::default() };
+        let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.search("xyz", Some(&[1.0]), &f).unwrap()), ["B"]);
+        assert_eq!(ids(s.search("quando", None, &f).unwrap()), ["A"]);
+    }
+
+    #[test]
+    fn unread_counts_start_after_your_reply_or_the_phone_read_mark() {
+        let (_d, s) = temp_store();
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let at = |n: i64| t + chrono::Duration::seconds(n);
+        let jid = "55@s.whatsapp.net";
+        s.store_chat(jid, "Ana", t).unwrap();
+        let msg = |id: &str, n: i64, me: bool, text: &str| s.store_message(id, jid, "55", text, at(n), me, &Media::default()).unwrap();
+        msg("A", 0, false, "oi");
+        msg("B", 1, true, "olá");
+        msg("C", 2, false, "tudo bem?");
+        msg("D", 3, false, "[reacted 👍 to: olá]");
+        msg("E", 4, false, "e aí?");
+        let unread = || s.get_chat(jid, false).unwrap().unwrap().unread_count;
+        assert_eq!(unread(), 0, "history from before tracking began counts as read");
+        s.conn().execute("UPDATE chat_reads SET read_at = ?1 WHERE jid = '*'", [format_ts(at(-1))]).unwrap();
+        assert_eq!(unread(), 2);
+        assert_eq!(s.unread_messages(jid).unwrap(), [("C".to_string(), "55".to_string()), ("E".to_string(), "55".to_string())]);
+        assert_eq!(s.list_chats(None, 10, 0, false, false, true).unwrap().len(), 1);
+        s.mark_read(jid, at(2)).unwrap();
+        assert_eq!(unread(), 1);
+        s.mark_read(jid, at(0)).unwrap();
+        assert_eq!(unread(), 1, "a read mark never moves back");
+        s.mark_read(jid, at(9)).unwrap();
+        assert_eq!(unread(), 0);
+        assert!(s.list_chats(None, 10, 0, false, false, true).unwrap().is_empty());
+        let active = s.active_chats(at(1), None, 10).unwrap();
+        assert_eq!(active.iter().map(|(c, n)| (c.jid.as_str(), *n)).collect::<Vec<_>>(), [(jid, 3)]);
+    }
+
+    #[test]
     fn allowlist_scopes_every_read() {
         let (_d, s) = temp_store();
         chat_with(&s, "1@s.whatsapp.net", &[("A", "segredo")]);
@@ -1103,7 +1227,7 @@ mod tests {
         assert!(s.allowed("2@g.us") && !s.allowed("1@s.whatsapp.net"));
         let all = s.list_messages(&MessageFilter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(all.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["B"]);
-        assert_eq!(s.list_chats(None, 10, 0, true, false).unwrap().len(), 1);
+        assert_eq!(s.list_chats(None, 10, 0, true, false, false).unwrap().len(), 1);
         assert!(s.get_chat("1@s.whatsapp.net", true).unwrap().is_none());
         assert!(s.message_context("A", 1, 1).unwrap().is_none());
         assert!(s.direct_chat_by_phone("1").unwrap().is_none());

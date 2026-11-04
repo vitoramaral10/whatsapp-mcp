@@ -122,6 +122,9 @@ pub struct ListChatsArgs {
     /// Field to sort results by, either "last_active" or "name" (default "last_active")
     #[serde(default = "dlast")]
     sort_by: String,
+    /// Only chats with unread messages (default False)
+    #[serde(default)]
+    unread_only: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -201,6 +204,40 @@ pub struct DeleteMessageArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct ReactionArgs {
+    /// The chat of the message: a phone number with country code or a JID
+    recipient: String,
+    /// The ID of the message to react to
+    message_id: String,
+    /// One emoji, e.g. "👍"; an empty string removes your reaction
+    emoji: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ChatArgs {
+    /// The chat: a phone number with country code or a JID
+    recipient: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DigestArgs {
+    /// ISO-8601 start of the period (e.g. "2026-11-04T00:00:00-03:00")
+    after: String,
+    /// Optional ISO-8601 end of the period (default now)
+    before: Option<String>,
+    /// Maximum number of chats, busiest first (default 20)
+    #[serde(default = "d20")]
+    max_chats: u32,
+    /// Maximum number of messages shown per chat, the latest ones (default 30)
+    #[serde(default = "d30")]
+    max_messages_per_chat: u32,
+}
+
+fn d30() -> u32 {
+    30
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// What to look for, in any words: matches by meaning as well as by the words themselves
     query: String,
@@ -277,7 +314,7 @@ impl Server {
     pub fn new(ctx: Arc<Ctx>) -> Self {
         let mut tool_router = Self::tool_router();
         if ctx.read_only {
-            for name in ["send_message", "send_file", "send_audio_message", "edit_message", "delete_message"] {
+            for name in ["send_message", "send_file", "send_audio_message", "edit_message", "delete_message", "send_reaction", "mark_chat_read"] {
                 tool_router.remove_route(name);
             }
         }
@@ -349,7 +386,7 @@ impl Server {
         json_out(
             self.ctx
                 .store
-                .list_chats(a.query.as_deref(), a.limit, a.page, a.include_last_message, a.sort_by == "name")
+                .list_chats(a.query.as_deref(), a.limit, a.page, a.include_last_message, a.sort_by == "name", a.unread_only)
                 .map_err(internal)?,
         )
     }
@@ -411,6 +448,45 @@ impl Server {
             return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
         }
         status(self.ctx.wa.delete(&a.recipient, &a.message_id).await)
+    }
+
+    #[tool(description = "React to a WhatsApp message with an emoji, or remove your reaction with an empty emoji.\n\nReturns a dictionary containing success status and a status message")]
+    async fn send_reaction(&self, Parameters(a): Parameters<ReactionArgs>) -> R {
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
+        }
+        status(self.ctx.wa.react(&a.recipient, &a.message_id, &a.emoji).await)
+    }
+
+    #[tool(description = "Mark every unread message of a WhatsApp chat as read: the senders see blue ticks and the chat shows as read on your phone.\n\nReturns a dictionary containing success status and a status message")]
+    async fn mark_chat_read(&self, Parameters(a): Parameters<ChatArgs>) -> R {
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
+        }
+        status(self.ctx.wa.mark_read(&a.recipient).await)
+    }
+
+    #[tool(description = "Everything said in a period, chat by chat (busiest first), with each chat's message and unread counts and its latest messages in order. Made for summaries such as \"what happened today\".")]
+    async fn get_digest(&self, Parameters(a): Parameters<DigestArgs>) -> R {
+        let bad = |what: &str| ErrorData::invalid_params(format!("{what} must be ISO-8601"), None);
+        let after = parse_ts(&a.after).ok_or_else(|| bad("after"))?;
+        let before = a.before.as_deref().map(|b| parse_ts(b).ok_or_else(|| bad("before"))).transpose()?;
+        let s = &self.ctx.store;
+        let chats = s.active_chats(after, before, a.max_chats).map_err(internal)?;
+        if chats.is_empty() {
+            return text("No messages in this period.");
+        }
+        let mut out = String::new();
+        for (chat, n) in chats {
+            let filter = MessageFilter { chat_jid: Some(chat.jid.clone()), after: Some(after), before, limit: a.max_messages_per_chat, ..Default::default() };
+            let mut msgs = s.list_messages(&filter).map_err(internal)?;
+            msgs.reverse();
+            let name = chat.name.as_deref().unwrap_or(&chat.jid);
+            out.push_str(&format!("## {name} ({}) - {n} messages, {} unread\n", chat.jid, chat.unread_count));
+            msgs.iter().for_each(|m| out.push_str(&format_message(s, m, false)));
+            out.push('\n');
+        }
+        text(out)
     }
 
     #[tool(description = "Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.\n\nReturns a dictionary containing success status and a status message")]
@@ -510,9 +586,9 @@ mod tests {
         };
         let (_a, full) = server(false);
         let (_b, ro) = server(true);
-        assert_eq!(names(&full).len(), 15);
+        assert_eq!(names(&full).len(), 18);
         assert!(names(&full).contains(&"search_messages".to_string()));
         let hidden: Vec<String> = names(&full).into_iter().filter(|n| !names(&ro).contains(n)).collect();
-        assert_eq!(hidden, ["delete_message", "edit_message", "send_audio_message", "send_file", "send_message"]);
+        assert_eq!(hidden, ["delete_message", "edit_message", "mark_chat_read", "send_audio_message", "send_file", "send_message", "send_reaction"]);
     }
 }
