@@ -6,9 +6,10 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for your pers
 account: search and read messages (images, videos, documents, voice notes), search contacts,
 and send text, files and voice notes to people or groups.
 
-> Fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp), rewritten from the
-> original Go bridge + Python server into a single Rust binary. Tool names and parameters stay
-> compatible with the original.
+> An independent Rust rewrite that started from Luke Harries'
+> [whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) (Go bridge + Python server). It shares
+> no code with it today, but keeps its tool names, parameters and history database, so existing
+> setups can switch over; see [Migrating from lharries/whatsapp-mcp](#migrating-from-lharrieswhatsapp-mcp).
 
 It connects through the WhatsApp Web multi-device protocol using
 [whatsapp-rust](https://github.com/oxidezap/whatsapp-rust). Messages are stored in a local
@@ -81,8 +82,8 @@ Clients that only speak stdio can go through [`mcp-remote`](https://www.npmjs.co
 | `WHATSAPP_LOG_LEVEL` | `info` | Log level of the WhatsApp library |
 | `WHATSAPP_LOG` | — | Full [`env_logger`](https://docs.rs/env_logger) filter; overrides the level above |
 
-The default store path keeps the layout of the original Go bridge, so existing deployments keep
-working; see [Migrating from the original](#migrating-from-the-original).
+The default store path keeps the layout of the lharries/whatsapp-mcp Go bridge, so existing
+deployments keep working.
 
 ## MCP tools
 
@@ -143,9 +144,9 @@ Both answer `{"success": bool, "message": string}`; `/api/download` adds `filena
   `WHATSAPP_ALLOWED_CHATS`.
 - Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
-## Migrating from the original
+## Migrating from lharries/whatsapp-mcp
 
-A store from the original Go bridge works as is: `messages.db` keeps its schema, and contacts
+A store from its Go bridge works as is: `messages.db` keeps its schema, and contacts
 and LID mappings are imported once from its `whatsapp.db`. The session itself cannot be carried
 over, so the device has to be paired again. The MCP tools keep their names and parameters.
 

@@ -13,6 +13,8 @@ and versions follow [Semantic Versioning](https://semver.org).
 - CI (fmt, clippy, tests, Docker build), security policy, compose and `.env` examples.
 
 ### Changed
+- The repository is no longer a GitHub fork of lharries/whatsapp-mcp; the credit stays in the
+  README and the license.
 - The REST API honours `WHATSAPP_READ_ONLY` and `WHATSAPP_ALLOWED_CHATS`, and listens on
   `WHATSAPP_API_HOST` (defaults to `MCP_HOST`).
 - Every tool failure is a tool error (`isError: true`) with `{"success": false, "message": ...}`;
@@ -49,7 +51,7 @@ and versions follow [Semantic Versioning](https://semver.org).
 ## [0.2.0] - 2026-11-03
 
 ### Changed
-- **Breaking:** the Go bridge and the Python MCP server are replaced by one static Rust binary
+- **Breaking:** the lharries/whatsapp-mcp Go bridge and Python MCP server are replaced by one static Rust binary
   in a `FROM scratch` image. The history store keeps its schema; the device must be paired again.
 
 ### Added
@@ -58,7 +60,8 @@ and versions follow [Semantic Versioning](https://semver.org).
 
 ## 2026-09-04
 
-- Docker deployment of the original Go bridge and Python server.
+- Docker deployment of the lharries/whatsapp-mcp Go bridge and Python server, on which this
+  project started.
 
 [Unreleased]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/vitoramaral10/whatsapp-mcp/releases/tag/v0.2.0
