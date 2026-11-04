@@ -278,6 +278,44 @@ fn native_flow_button(name: &str, raw: &str) -> String {
 
 /// The attachment, if any. The filename is derived from the message time so a
 /// replayed message gets the same name.
+/// A message that changes an earlier one instead of saying something new.
+#[derive(Debug, PartialEq)]
+pub enum Change {
+    Edit { id: String, text: String },
+    Revoke { id: String },
+    /// An empty emoji takes the reaction back.
+    React { id: String, emoji: String },
+}
+
+pub fn change(m: &wa::Message) -> Option<Change> {
+    change_depth(m, 0)
+}
+
+fn change_depth(m: &wa::Message, depth: u8) -> Option<Change> {
+    use wa::message::protocol_message::Type;
+    if depth > 4 {
+        return None;
+    }
+    if let Some(c) = inner(m).find_map(|i| change_depth(i, depth + 1)) {
+        return Some(c);
+    }
+    let target = |k: &wa::MessageKey| k.id.clone().filter(|id| !id.is_empty());
+    if let Some(p) = m.protocol_message.as_option() {
+        let id = p.key.as_option().and_then(target)?;
+        let kind = p.r#type.as_ref()?;
+        if *kind == Type::REVOKE {
+            return Some(Change::Revoke { id });
+        }
+        if *kind == Type::MESSAGE_EDIT {
+            let text = p.edited_message.as_option().map(text).unwrap_or_default();
+            return (!text.is_empty()).then_some(Change::Edit { id, text });
+        }
+        return None;
+    }
+    let r = m.reaction_message.as_option()?;
+    Some(Change::React { id: r.key.as_option().and_then(target)?, emoji: s(&r.text).to_string() })
+}
+
 pub fn media(m: &wa::Message, ts: DateTime<Utc>) -> Media {
     media_depth(m, ts, 0)
 }
@@ -397,6 +435,41 @@ mod tests {
         assert_eq!(text(&m), "olha");
         let media = media(&m, ts());
         assert_eq!((media.kind.as_str(), media.filename.as_str(), media.direct_path.as_str()), ("image", "image_20261103_140232.png", "/v/x"));
+    }
+
+    #[test]
+    fn edits_deletions_and_reactions_point_at_their_target() {
+        use wa::message::protocol_message::Type;
+        let key = || MessageField::some(wa::MessageKey { id: Some("T1".into()), ..Default::default() });
+        let protocol = |kind, edited: Option<&str>| wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage {
+                key: key(),
+                r#type: Some(kind),
+                edited_message: edited
+                    .map(|t| MessageField::some(wa::Message { conversation: Some(t.into()), ..Default::default() }))
+                    .unwrap_or_default(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(change(&protocol(Type::REVOKE, None)), Some(Change::Revoke { id: "T1".into() }));
+        // Edits arrive inside the editedMessage container.
+        let edit = wa::Message {
+            edited_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(protocol(Type::MESSAGE_EDIT, Some("novo"))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(change(&edit), Some(Change::Edit { id: "T1".into(), text: "novo".into() }));
+        assert_eq!(text(&edit), "");
+        let react = wa::Message {
+            reaction_message: MessageField::some(wa::message::ReactionMessage { key: key(), text: Some("👍".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(change(&react), Some(Change::React { id: "T1".into(), emoji: "👍".into() }));
+        let plain = wa::Message { conversation: Some("oi".into()), ..Default::default() };
+        assert_eq!(change(&plain), None);
     }
 
     #[test]

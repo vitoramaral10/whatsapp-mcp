@@ -25,6 +25,9 @@ fn is_placeholder(name: &str) -> bool {
     digits.is_empty() || digits.bytes().all(|b| b.is_ascii_digit())
 }
 
+pub const EDITED: &str = "[edited] ";
+pub const DELETED: &str = "[deleted] ";
+
 pub fn format_ts(ts: DateTime<Utc>) -> String {
     ts.format(TS_FORMAT).to_string()
 }
@@ -100,6 +103,10 @@ pub struct MessageFilter {
 
 pub struct Store {
     db: Mutex<Connection>,
+    /// What the MCP tools read through. With an allowlist its temp views
+    /// shadow chats, messages and contacts, so every query sees only those chats.
+    reads: Mutex<Connection>,
+    allow: std::sync::OnceLock<Vec<String>>,
 }
 
 const MSG_COLS: &str = "messages.timestamp, messages.sender, chats.name, messages.content, \
@@ -139,14 +146,39 @@ const LAST_MESSAGE_JOIN: &str = "LEFT JOIN messages m ON m.rowid = (
         SELECT x.rowid FROM messages x WHERE x.chat_jid = c.jid
         ORDER BY x.timestamp DESC LIMIT 1)";
 
+fn connect(path: &Path) -> Result<Connection> {
+    let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    db.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    Ok(db)
+}
+
+/// Words of a free-text query as an FTS5 expression: each word a quoted prefix,
+/// so user input never parses as FTS syntax. None when no word is left.
+fn fts_query(q: &str, joiner: &str) -> Option<String> {
+    let words: Vec<String> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{w}\"*"))
+        .collect();
+    (!words.is_empty()).then(|| words.join(joiner))
+}
+
+/// Embeddings are stored as little-endian f32, normalized, so a dot product is the cosine.
+pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn dot(blob: &[u8], q: &[f32]) -> f32 {
+    blob.chunks_exact(4).zip(q).map(|(b, x)| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) * x).sum()
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let db = connect(path)?;
         db.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
-             PRAGMA temp_store = MEMORY;
              CREATE TABLE IF NOT EXISTS chats (
                  jid TEXT PRIMARY KEY,
                  name TEXT,
@@ -191,7 +223,69 @@ impl Store {
         if !has_direct_path {
             db.execute("ALTER TABLE messages ADD COLUMN direct_path TEXT", [])?;
         }
-        Ok(Self { db: Mutex::new(db) })
+        // Full-text index over the content, kept in step by triggers; vectors
+        // for semantic search, dropped whenever the text they encode changes.
+        let has_fts: bool = db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'")?.exists([])?;
+        db.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                 content, content = 'messages', content_rowid = 'rowid', tokenize = 'unicode61 remove_diacritics 2');
+             CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                 INSERT INTO messages_fts (rowid, content) VALUES (new.rowid, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                 INSERT INTO messages_fts (messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                 DELETE FROM message_vec WHERE rowid = old.rowid;
+             END;
+             CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+                 INSERT INTO messages_fts (messages_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+                 INSERT INTO messages_fts (rowid, content) VALUES (new.rowid, new.content);
+                 DELETE FROM message_vec WHERE rowid = old.rowid;
+             END;
+             CREATE TABLE IF NOT EXISTS message_vec (
+                 rowid INTEGER PRIMARY KEY,
+                 embedding BLOB NOT NULL
+             );",
+        )?;
+        if !has_fts {
+            db.execute("INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')", [])?;
+        }
+        let reads = connect(path)?;
+        reads.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(Self { db: Mutex::new(db), reads: Mutex::new(reads), allow: Default::default() })
+    }
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Limits every MCP read to these chats (full JIDs). Phone-number chats
+    /// also cover their LID twin, and contacts are only the people in them.
+    pub fn restrict(&self, chats: &[String]) -> Result<()> {
+        let mut jids: Vec<String> = chats.to_vec();
+        for jid in chats {
+            if let Some(user) = jid.strip_suffix("@s.whatsapp.net") {
+                if let Some(lid) = self.lid_for_pn(user) {
+                    jids.push(format!("{lid}@lid"));
+                }
+            }
+        }
+        let _ = self.allow.set(jids.clone());
+        let list = jids.iter().map(|j| format!("'{}'", j.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        let db = self.reads();
+        db.execute_batch("PRAGMA query_only = OFF;")?;
+        db.execute_batch(&format!(
+            "CREATE TEMP VIEW chats AS SELECT * FROM main.chats WHERE jid IN ({list});
+             CREATE TEMP VIEW messages AS SELECT rowid AS rowid, * FROM main.messages WHERE chat_jid IN ({list});
+             CREATE TEMP VIEW contacts AS SELECT * FROM main.contacts
+                 WHERE jid IN ({list}) OR jid IN (SELECT DISTINCT sender || '@s.whatsapp.net' FROM main.messages WHERE chat_jid IN ({list}));
+             PRAGMA query_only = ON;"
+        ))?;
+        Ok(())
+    }
+
+    /// Whether the MCP tools may touch this chat (a full JID).
+    pub fn allowed(&self, jid: &str) -> bool {
+        self.allow.get().is_none_or(|list| list.iter().any(|j| j == jid))
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -259,10 +353,18 @@ impl Store {
             return Ok(false);
         }
         self.conn().execute(
-            "INSERT OR REPLACE INTO messages
+            // An upsert, not REPLACE: the row keeps its rowid, which the
+            // full-text index and the vectors are keyed by.
+            "INSERT INTO messages
              (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url,
               media_key, file_sha256, file_enc_sha256, file_length, direct_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(id, chat_jid) DO UPDATE SET
+               sender = excluded.sender, content = excluded.content, timestamp = excluded.timestamp,
+               is_from_me = excluded.is_from_me, media_type = excluded.media_type, filename = excluded.filename,
+               url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+               file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length,
+               direct_path = excluded.direct_path",
             params![
                 id,
                 chat_jid,
@@ -413,15 +515,18 @@ impl Store {
 
     // ---- media --------------------------------------------------------------
 
-    pub fn media(&self, id: &str, chat_jid: &str) -> Result<Option<Media>> {
+    /// A message's attachment, plus who sent it (is_from_me, sender user):
+    /// asking the phone to re-upload expired media needs both.
+    pub fn media(&self, id: &str, chat_jid: &str) -> Result<Option<(Media, bool, String)>> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length
+                "SELECT media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length,
+                        is_from_me, sender
                  FROM messages WHERE id = ?1 AND chat_jid = ?2",
                 [id, chat_jid],
                 |r| {
-                    Ok(Media {
+                    let media = Media {
                         kind: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
                         filename: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                         url: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
@@ -430,10 +535,139 @@ impl Store {
                         file_sha256: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
                         file_enc_sha256: r.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
                         file_length: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
-                    })
+                    };
+                    Ok((media, r.get::<_, Option<bool>>(8)?.unwrap_or(false), r.get::<_, Option<String>>(9)?.unwrap_or_default()))
                 },
             )
             .optional()?)
+    }
+
+    /// An edit replaces the text, a deletion keeps it under a marker: the record
+    /// of what was said outlives the "deleted for everyone".
+    /// False when the original is not on file.
+    pub fn edit_message(&self, id: &str, chat_jid: &str, text: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE messages SET content = ?3 WHERE id = ?1 AND chat_jid = ?2",
+            params![id, chat_jid, format!("{EDITED}{text}")],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn revoke_message(&self, id: &str, chat_jid: &str) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE messages SET content = ?3 || COALESCE(content, '')
+             WHERE id = ?1 AND chat_jid = ?2 AND COALESCE(content, '') NOT LIKE ?3 || '%'",
+            params![id, chat_jid, DELETED],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// (is_from_me, sender, content) of a message, to quote it in a reply.
+    pub fn quote(&self, id: &str, chat_jid: &str) -> Result<Option<(bool, String, String)>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT is_from_me, sender, content FROM messages WHERE id = ?1 AND chat_jid = ?2", [id, chat_jid], |r| {
+                Ok((
+                    r.get::<_, Option<bool>>(0)?.unwrap_or(false),
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })
+            .optional()?)
+    }
+
+    pub fn message_content(&self, id: &str, chat_jid: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT content FROM messages WHERE id = ?1 AND chat_jid = ?2", [id, chat_jid], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The new CDN path after the phone re-uploaded expired media.
+    pub fn set_direct_path(&self, id: &str, chat_jid: &str, direct_path: &str) -> Result<()> {
+        self.conn()
+            .execute("UPDATE messages SET direct_path = ?3 WHERE id = ?1 AND chat_jid = ?2", params![id, chat_jid, direct_path])?;
+        Ok(())
+    }
+
+    // ---- semantic search -----------------------------------------------------
+
+    /// Newest messages with text and no vector yet.
+    pub fn unembedded(&self, n: usize) -> Result<Vec<(i64, String)>> {
+        let db = self.conn();
+        let mut stmt = db.prepare(
+            "SELECT m.rowid, m.content FROM messages m LEFT JOIN message_vec v ON v.rowid = m.rowid
+             WHERE v.rowid IS NULL AND length(trim(m.content)) > 1 ORDER BY m.timestamp DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn put_vectors(&self, rows: &[(i64, Vec<f32>)]) -> Result<()> {
+        let mut db = self.conn();
+        let tx = db.transaction()?;
+        for (rowid, v) in rows {
+            tx.execute("INSERT OR REPLACE INTO message_vec (rowid, embedding) VALUES (?1, ?2)", params![rowid, vec_to_blob(v)])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hybrid search: full-text (BM25) and, given a query vector, cosine over the
+    /// stored ones, merged by reciprocal rank. Best match first.
+    pub fn search(&self, query: &str, qvec: Option<&[f32]>, f: &MessageFilter) -> Result<Vec<Message>> {
+        const POOL: usize = 50;
+        let mut clauses = vec!["1".to_string()];
+        let mut args: Vec<String> = Vec::new();
+        for (cond, val) in [
+            ("messages.chat_jid = ?", f.chat_jid.clone()),
+            ("messages.sender = ?", f.sender.clone()),
+            ("messages.timestamp > ?", f.after.map(format_ts)),
+            ("messages.timestamp < ?", f.before.map(format_ts)),
+        ] {
+            if let Some(v) = val {
+                clauses.push(cond.to_string());
+                args.push(v);
+            }
+        }
+        let filter = clauses.join(" AND ");
+        let db = self.reads();
+        let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+        let mut add = |ranked: Vec<i64>| {
+            for (rank, rowid) in ranked.into_iter().enumerate() {
+                *scores.entry(rowid).or_default() += 1.0 / (60.0 + rank as f64);
+            }
+        };
+        if let Some(fts) = fts_query(query, " OR ") {
+            let mut stmt = db.prepare(&format!(
+                "SELECT messages.rowid FROM messages_fts JOIN messages ON messages.rowid = messages_fts.rowid
+                 WHERE messages_fts MATCH ? AND {filter} ORDER BY bm25(messages_fts) LIMIT {POOL}"
+            ))?;
+            let p = std::iter::once(fts).chain(args.iter().cloned());
+            add(stmt.query_map(rusqlite::params_from_iter(p), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?);
+        }
+        if let Some(q) = qvec {
+            let mut stmt = db.prepare(&format!(
+                "SELECT message_vec.rowid, message_vec.embedding FROM message_vec
+                 JOIN messages ON messages.rowid = message_vec.rowid WHERE {filter}"
+            ))?;
+            let mut best: Vec<(f32, i64)> = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| Ok((dot(&r.get::<_, Vec<u8>>(1)?, q), r.get(0)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            best.sort_by(|a, b| b.0.total_cmp(&a.0));
+            add(best.into_iter().take(POOL).map(|(_, id)| id).collect());
+        }
+        let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let mut stmt = db.prepare(&format!("SELECT {MSG_COLS} FROM messages JOIN chats ON messages.chat_jid = chats.jid WHERE messages.rowid = ?1"))?;
+        let mut out = Vec::new();
+        for (rowid, _) in ranked.into_iter().skip(f.page as usize * f.limit as usize).take(f.limit as usize) {
+            if let Some(m) = stmt.query_row([rowid], row_message).optional()? {
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     // ---- reads for the MCP tools -------------------------------------------
@@ -459,8 +693,16 @@ impl Store {
             args.push(Box::new(c.clone()));
         }
         if let Some(q) = &f.query {
-            clauses.push("LOWER(messages.content) LIKE LOWER(?)");
-            args.push(Box::new(format!("%{q}%")));
+            match fts_query(q, " ") {
+                Some(fts) => {
+                    clauses.push("messages.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)");
+                    args.push(Box::new(fts));
+                }
+                None => {
+                    clauses.push("LOWER(messages.content) LIKE LOWER(?)");
+                    args.push(Box::new(format!("%{q}%")));
+                }
+            }
         }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
@@ -469,7 +711,7 @@ impl Store {
         sql.push_str(" ORDER BY messages.timestamp DESC LIMIT ? OFFSET ?");
         args.push(Box::new(f.limit as i64));
         args.push(Box::new(f.page as i64 * f.limit as i64));
-        let db = self.conn();
+        let db = self.reads();
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), row_message)?
@@ -478,7 +720,7 @@ impl Store {
     }
 
     pub fn message_context(&self, id: &str, before: u32, after: u32) -> Result<Option<MessageContext>> {
-        let db = self.conn();
+        let db = self.reads();
         let Some(target) = db
             .query_row(
                 &format!("SELECT {MSG_COLS} FROM messages JOIN chats ON messages.chat_jid = chats.jid WHERE messages.id = ?1"),
@@ -527,7 +769,7 @@ impl Store {
         }
         sql.push_str(if by_name { " ORDER BY c.name" } else { " ORDER BY c.last_message_time DESC" });
         sql.push_str(&format!(" LIMIT {} OFFSET {}", limit, page as u64 * limit as u64));
-        let db = self.conn();
+        let db = self.reads();
         let mut stmt = db.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), row_chat)?
@@ -541,12 +783,12 @@ impl Store {
         } else {
             "SELECT c.jid, c.name, c.last_message_time, NULL, NULL, NULL FROM chats c WHERE c.jid = ?1".into()
         };
-        Ok(self.conn().query_row(&sql, [jid], row_chat).optional()?)
+        Ok(self.reads().query_row(&sql, [jid], row_chat).optional()?)
     }
 
     pub fn direct_chat_by_phone(&self, phone: &str) -> Result<Option<Chat>> {
         Ok(self
-            .conn()
+            .reads()
             .query_row(
                 &format!(
                     "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me FROM chats c
@@ -559,7 +801,7 @@ impl Store {
     }
 
     pub fn contact_chats(&self, jid: &str, limit: u32, page: u32) -> Result<Vec<Chat>> {
-        let db = self.conn();
+        let db = self.reads();
         let mut stmt = db.prepare(&format!(
             "SELECT c.jid, c.name, c.last_message_time, m.content, m.sender, m.is_from_me FROM chats c
              {LAST_MESSAGE_JOIN}
@@ -574,7 +816,7 @@ impl Store {
 
     pub fn last_interaction(&self, jid: &str) -> Result<Option<Message>> {
         Ok(self
-            .conn()
+            .reads()
             .query_row(
                 &format!(
                     "SELECT {MSG_COLS} FROM messages JOIN chats ON messages.chat_jid = chats.jid
@@ -589,7 +831,7 @@ impl Store {
     /// Name shown for a sender: the chat row for that JID, then any chat whose
     /// JID contains the number, then the raw value.
     pub fn sender_name(&self, sender: &str) -> String {
-        let db = self.conn();
+        let db = self.reads();
         let exact = db
             .query_row("SELECT name FROM chats WHERE jid = ?1 LIMIT 1", [sender], |r| r.get::<_, Option<String>>(0))
             .optional()
@@ -614,7 +856,7 @@ impl Store {
     /// Address book plus chat partners, one entry per phone number, named first.
     pub fn search_contacts(&self, query: &str) -> Result<Vec<Contact>> {
         let pattern = format!("%{query}%");
-        let db = self.conn();
+        let db = self.reads();
         let best = "COALESCE(NULLIF(full_name, ''), NULLIF(business_name, ''), NULLIF(first_name, ''), NULLIF(push_name, ''))";
         let mut rows: Vec<(String, Option<String>)> = db
             .prepare(&format!(
@@ -739,10 +981,97 @@ mod tests {
         let media = Media { kind: "image".into(), filename: "a.jpg".into(), direct_path: "/v/x?oh=1".into(), file_length: 9, ..Default::default() };
         assert!(s.store_message("ID1", "55@s.whatsapp.net", "55", "oi", t, false, &media).unwrap());
         assert!(!s.store_message("ID2", "55@s.whatsapp.net", "55", "", t, false, &Media::default()).unwrap());
-        assert_eq!(s.media("ID1", "55@s.whatsapp.net").unwrap().unwrap(), media);
+        assert_eq!(s.media("ID1", "55@s.whatsapp.net").unwrap().unwrap(), (media.clone(), false, "55".to_string()));
+        s.set_direct_path("ID1", "55@s.whatsapp.net", "/v/new").unwrap();
+        assert_eq!(s.media("ID1", "55@s.whatsapp.net").unwrap().unwrap().0.direct_path, "/v/new");
         let msgs = s.list_messages(&MessageFilter { limit: 10, ..Default::default() }).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(format_message(&s, &msgs[0], true), "[2026-01-02 03:04:05] Chat: Ana From: Ana: [image - Message ID: ID1 - Chat JID: 55@s.whatsapp.net] oi\n");
+    }
+
+    #[test]
+    fn edits_replace_text_and_deletions_keep_it_once() {
+        let (_d, s) = temp_store();
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        s.store_chat("55@s.whatsapp.net", "Ana", t).unwrap();
+        s.store_message("A", "55@s.whatsapp.net", "55", "oi", t, false, &Media::default()).unwrap();
+        assert!(s.edit_message("A", "55@s.whatsapp.net", "olá").unwrap());
+        assert_eq!(s.message_content("A", "55@s.whatsapp.net").as_deref(), Some("[edited] olá"));
+        assert!(s.revoke_message("A", "55@s.whatsapp.net").unwrap());
+        assert!(!s.revoke_message("A", "55@s.whatsapp.net").unwrap());
+        assert_eq!(s.message_content("A", "55@s.whatsapp.net").as_deref(), Some("[deleted] [edited] olá"));
+        assert!(!s.edit_message("missing", "55@s.whatsapp.net", "x").unwrap());
+    }
+
+    fn chat_with(s: &Store, jid: &str, msgs: &[(&str, &str)]) {
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        s.store_chat(jid, "x", t).unwrap();
+        for (i, (id, text)) in msgs.iter().enumerate() {
+            s.store_message(id, jid, "55", text, t + chrono::Duration::seconds(i as i64), false, &Media::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn full_text_query_ignores_case_accents_and_syntax_and_follows_edits() {
+        let (_d, s) = temp_store();
+        chat_with(&s, "55@s.whatsapp.net", &[("A", "Vamos viajar para Floripa"), ("B", "Reunião amanhã às 9")]);
+        let q = |q: &str| {
+            s.list_messages(&MessageFilter { query: Some(q.into()), limit: 10, ..Default::default() })
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(q("floripa"), ["A"]);
+        assert_eq!(q("reuniao"), ["B"]);
+        assert_eq!(q("viaj"), ["A"]);
+        assert_eq!(q("\"NEAR( *"), Vec::<String>::new());
+        // Re-storing keeps the rowid; an edit re-indexes the text.
+        chat_with(&s, "55@s.whatsapp.net", &[("A", "Vamos viajar para Floripa")]);
+        assert_eq!(q("floripa"), ["A"]);
+        s.edit_message("A", "55@s.whatsapp.net", "mudou para Curitiba").unwrap();
+        assert_eq!(q("curitiba"), ["A"]);
+        assert!(q("floripa").is_empty());
+    }
+
+    #[test]
+    fn hybrid_search_merges_words_and_vectors_and_edits_drop_stale_vectors() {
+        let (_d, s) = temp_store();
+        chat_with(&s, "55@s.whatsapp.net", &[("A", "passagem comprada"), ("B", "bolo de cenoura"), ("C", "viagem de férias")]);
+        let rows = s.unembedded(10).unwrap();
+        assert_eq!(rows.len(), 3);
+        let axis = |i: usize| (0..3).map(|j| if i == j { 1.0 } else { 0.0 }).collect::<Vec<f32>>();
+        let by_text: std::collections::HashMap<String, i64> = rows.iter().map(|(r, t)| (t.clone(), *r)).collect();
+        s.put_vectors(&[(by_text["passagem comprada"], axis(0)), (by_text["bolo de cenoura"], axis(1)), (by_text["viagem de férias"], axis(2))]).unwrap();
+        assert!(s.unembedded(10).unwrap().is_empty());
+        let f = MessageFilter { limit: 2, ..Default::default() };
+        let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        // "ferias" hits C by words; the vector points at A: both come back, C (found twice) first.
+        let q = [0.1, 0.0, 0.9_f32];
+        assert_eq!(ids(s.search("ferias", Some(&q), &f).unwrap()), ["C", "A"]);
+        assert_eq!(ids(s.search("cenoura", None, &f).unwrap()), ["B"]);
+        s.edit_message("B", "55@s.whatsapp.net", "torta").unwrap();
+        assert_eq!(s.unembedded(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn allowlist_scopes_every_read() {
+        let (_d, s) = temp_store();
+        chat_with(&s, "1@s.whatsapp.net", &[("A", "segredo")]);
+        chat_with(&s, "2@g.us", &[("B", "liberado")]);
+        s.restrict(&["2@g.us".to_string()]).unwrap();
+        assert!(s.allowed("2@g.us") && !s.allowed("1@s.whatsapp.net"));
+        let all = s.list_messages(&MessageFilter { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["B"]);
+        assert_eq!(s.list_chats(None, 10, 0, true, false).unwrap().len(), 1);
+        assert!(s.get_chat("1@s.whatsapp.net", true).unwrap().is_none());
+        assert!(s.message_context("A", 1, 1).unwrap().is_none());
+        assert!(s.direct_chat_by_phone("1").unwrap().is_none());
+        assert!(s.last_interaction("1@s.whatsapp.net").unwrap().is_none());
+        assert!(s.search("segredo", None, &MessageFilter { limit: 5, ..Default::default() }).unwrap().is_empty());
+        // Writes still land: history keeps recording every chat.
+        chat_with(&s, "1@s.whatsapp.net", &[("C", "outro")]);
+        assert_eq!(s.message_content("C", "1@s.whatsapp.net").as_deref(), Some("outro"));
     }
 
     #[test]

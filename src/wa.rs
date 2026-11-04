@@ -152,6 +152,9 @@ impl Wa {
         let name = self.chat_name(&chat, None, hint).await;
         self.store.store_chat(&chat_jid, &name, info.timestamp)?;
 
+        if let Some(change) = extract::change(msg) {
+            return self.apply(change, &info.id, &chat_jid, &sender, info.timestamp, info.source.is_from_me);
+        }
         let content = extract::text(msg);
         let media = extract::media(msg, info.timestamp);
         if content.is_empty() && media.kind.is_empty() {
@@ -164,6 +167,29 @@ impl Wa {
             info!("{dir} {sender}: {content}");
         } else {
             info!("{dir} {sender}: [{}: {}] {content}", media.kind, media.filename);
+        }
+        Ok(())
+    }
+
+    /// Edits and deletions rewrite the original; a reaction is its own line in
+    /// the chat, quoting what it reacts to.
+    fn apply(&self, change: extract::Change, id: &str, chat_jid: &str, sender: &str, ts: chrono::DateTime<Utc>, from_me: bool) -> Result<()> {
+        use extract::Change;
+        let (target, found) = match &change {
+            Change::Edit { id, text } => (id, self.store.edit_message(id, chat_jid, text)?),
+            Change::Revoke { id } => (id, self.store.revoke_message(id, chat_jid)?),
+            Change::React { emoji, .. } if emoji.is_empty() => return Ok(()),
+            Change::React { id: target, emoji } => {
+                let quoted: String = self.store.message_content(target, chat_jid).unwrap_or_default().chars().take(80).collect();
+                let content = if quoted.is_empty() { format!("[reacted {emoji}]") } else { format!("[reacted {emoji} to: {quoted}]") };
+                self.store.store_message(id, chat_jid, sender, &content, ts, from_me, &Default::default())?;
+                (target, true)
+            }
+        };
+        if found {
+            info!("{change:?} in {chat_jid}");
+        } else {
+            debug!("{change:?} in {chat_jid}: message {target} is not on file");
         }
         Ok(())
     }
@@ -214,6 +240,12 @@ impl Wa {
                     chat.user.to_string()
                 };
                 let id = key.and_then(|k| k.id.clone()).unwrap_or_default();
+                if let Some(change) = extract::change(m) {
+                    if self.store.store_chat(&chat_jid, &name, ts).is_ok() {
+                        let _ = self.apply(change, &id, &chat_jid, &sender, ts, from_me);
+                    }
+                    continue;
+                }
                 let content = extract::text(m);
                 let media = extract::media(m, ts);
                 if content.is_empty() && media.kind.is_empty() {
@@ -292,8 +324,8 @@ impl Wa {
     // ---- send ---------------------------------------------------------------
 
     /// Text, or a file whose extension picks how it is sent. `voice` turns any
-    /// decodable audio into a voice note.
-    pub async fn send(&self, recipient: &str, text: &str, file: Option<media::Outgoing>, voice: bool) -> Result<String> {
+    /// decodable audio into a voice note. `reply_to` quotes a message of that chat.
+    pub async fn send(&self, recipient: &str, text: &str, file: Option<media::Outgoing>, voice: bool, reply_to: Option<&str>) -> Result<String> {
         let client = self.client()?;
         if !client.is_connected() {
             bail!("Not connected to WhatsApp");
@@ -303,14 +335,23 @@ impl Wa {
         } else {
             Jid::new(recipient, Server::Pn)
         };
+        let chat = self.canonical(&to).await;
+        let context = self.context_info(client, &chat, text, reply_to)?;
         let msg = match file {
-            None => wa::Message { conversation: Some(text.to_string()), ..Default::default() },
-            Some(f) => self.media_message(client, text, f, voice).await?,
+            None if context.as_option().is_none() => wa::Message { conversation: Some(text.to_string()), ..Default::default() },
+            None => wa::Message {
+                extended_text_message: MessageField::some(wa::message::ExtendedTextMessage {
+                    text: Some(text.to_string()),
+                    context_info: context,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(f) => self.media_message(client, text, f, voice, context).await?,
         };
         let sent = client.send_message(to.clone(), msg.clone()).await.map_err(|e| anyhow!("Error sending message: {e}"))?;
         // WhatsApp does not echo a sent message back, so it is recorded here or
         // never appears in the history.
-        let chat = self.canonical(&to).await;
         let own = client.pn().map(|j| j.user.to_string()).unwrap_or_default();
         let now = Utc::now();
         let name = self.chat_name(&chat, None, "").await;
@@ -322,7 +363,32 @@ impl Wa {
         Ok(format!("Message sent to {recipient}"))
     }
 
-    async fn media_message(&self, client: &Client, caption: &str, f: media::Outgoing, voice: bool) -> Result<wa::Message> {
+    /// Mentions (every "@<phone number>" in the text) and the quoted message of
+    /// a reply. None when there is neither.
+    fn context_info(&self, client: &Client, chat: &Jid, text: &str, reply_to: Option<&str>) -> Result<MessageField<wa::ContextInfo>> {
+        let mut info = wa::ContextInfo { mentioned_jid: mentions(text), ..Default::default() };
+        if let Some(id) = reply_to.filter(|id| !id.is_empty()) {
+            let chat_jid = chat.to_string();
+            let (from_me, sender, content) =
+                self.store.quote(id, &chat_jid)?.ok_or_else(|| anyhow!("message {id} to reply to is not in this chat"))?;
+            let author = if from_me { client.pn().map(|j| j.to_non_ad().user.to_string()).unwrap_or_default() } else { sender };
+            info.stanza_id = Some(id.to_string());
+            info.participant = Some(format!("{author}@s.whatsapp.net"));
+            info.quoted_message = MessageField::some(wa::Message { conversation: Some(content), ..Default::default() });
+        } else if info.mentioned_jid.is_empty() {
+            return Ok(MessageField::none());
+        }
+        Ok(MessageField::some(info))
+    }
+
+    async fn media_message(
+        &self,
+        client: &Client,
+        caption: &str,
+        f: media::Outgoing,
+        voice: bool,
+        context_info: MessageField<wa::ContextInfo>,
+    ) -> Result<wa::Message> {
         let ext = Path::new(&f.name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         let caption = (!caption.is_empty()).then(|| caption.to_string());
         if voice || ext == "ogg" || ext == "opus" {
@@ -343,6 +409,7 @@ impl Wa {
                     seconds: Some(note.seconds),
                     ptt: Some(true),
                     waveform: Some(note.waveform),
+                    context_info,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -367,6 +434,7 @@ impl Wa {
                     file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
                     file_sha256: Some(up.file_sha256.to_vec()),
                     file_length: Some(up.file_length),
+                    context_info,
                     ..Default::default()
                 })
             }
@@ -380,6 +448,7 @@ impl Wa {
                     file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
                     file_sha256: Some(up.file_sha256.to_vec()),
                     file_length: Some(up.file_length),
+                    context_info,
                     ..Default::default()
                 })
             }
@@ -395,6 +464,7 @@ impl Wa {
                     file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
                     file_sha256: Some(up.file_sha256.to_vec()),
                     file_length: Some(up.file_length),
+                    context_info,
                     ..Default::default()
                 })
             }
@@ -406,7 +476,7 @@ impl Wa {
 
     /// Saves a message's media under the store and returns (kind, path).
     pub async fn download(&self, message_id: &str, chat_jid: &str) -> Result<(String, PathBuf)> {
-        let m = self.store.media(message_id, chat_jid)?.ok_or_else(|| anyhow!("failed to find message"))?;
+        let (mut m, from_me, sender) = self.store.media(message_id, chat_jid)?.ok_or_else(|| anyhow!("failed to find message"))?;
         if m.kind.is_empty() {
             bail!("not a media message");
         }
@@ -414,13 +484,55 @@ impl Wa {
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok((m.kind, path));
         }
-        let data = self.fetch(&m).await?;
+        let data = match self.fetch(&m).await {
+            Ok(data) => data,
+            // The CDN drops media after a few weeks; the phone can upload it again.
+            Err(e) => {
+                warn!("download of {message_id} failed ({e:#}); asking the phone to re-upload it");
+                m.direct_path = self.reupload(message_id, chat_jid, &m, from_me, &sender).await.context(format!("{e:#}"))?;
+                self.store.set_direct_path(message_id, chat_jid, &m.direct_path)?;
+                self.fetch(&m).await?
+            }
+        };
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         tokio::fs::write(&path, &data).await.context("failed to save media file")?;
         info!("downloaded {} media to {} ({} bytes)", m.kind, path.display(), data.len());
         Ok((m.kind, path))
+    }
+
+    async fn reupload(&self, message_id: &str, chat_jid: &str, m: &Media, from_me: bool, sender: &str) -> Result<String> {
+        use whatsapp_rust::{MediaReuploadRequest, MediaRetryResult};
+        if m.media_key.is_empty() {
+            bail!("no media key to request a re-upload with");
+        }
+        let chat: Jid = chat_jid.parse().map_err(|e| anyhow!("bad chat JID {chat_jid}: {e:?}"))?;
+        let participant = (chat.server == Server::Group && !from_me && !sender.is_empty()).then(|| Jid::new(sender, Server::Pn));
+        // Chats are stored under the phone number, but the phone only answers for
+        // the address the message was keyed under, which is the LID when one exists.
+        let mut chats = vec![chat.clone()];
+        if chat.is_pn() {
+            if let Some(lid) = self.store.lid_for_pn(&chat.user) {
+                chats.insert(0, Jid::new(&lid, Server::Lid));
+            }
+        }
+        let mut last = anyhow!("no address to ask");
+        for chat in &chats {
+            let req = MediaReuploadRequest {
+                msg_id: message_id,
+                chat_jid: chat,
+                media_key: &m.media_key,
+                is_from_me: from_me,
+                participant: participant.as_ref(),
+            };
+            match self.client()?.media_reupload().request(&req).await {
+                Ok(MediaRetryResult::Success { direct_path }) => return Ok(direct_path),
+                Ok(other) => bail!("media re-upload refused: {other:?}"),
+                Err(e) => last = anyhow!("media re-upload via {chat} failed: {e}"),
+            }
+        }
+        Err(last)
     }
 
     async fn fetch(&self, m: &Media) -> Result<Vec<u8>> {
@@ -443,6 +555,29 @@ impl Wa {
         };
         let params = DownloadParams::encrypted(direct_path, &m.media_key, &m.file_sha256, &m.file_enc_sha256, m.file_length, kind);
         self.client()?.download(&params).await.map_err(|e| anyhow!("failed to download media: {e}"))
+    }
+}
+
+/// JIDs for every "@<phone number>" in the text.
+fn mentions(text: &str) -> Vec<String> {
+    text.split('@')
+        .skip(1)
+        .filter_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            (8..=15).contains(&digits.len()).then(|| format!("{digits}@s.whatsapp.net"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mentions_are_phone_numbers_after_an_at() {
+        assert_eq!(
+            super::mentions("oi @5511999999999, fala com @554391524065! e-mail a@b.com @123"),
+            vec!["5511999999999@s.whatsapp.net".to_string(), "554391524065@s.whatsapp.net".to_string()]
+        );
+        assert!(super::mentions("sem menção").is_empty());
     }
 }
 

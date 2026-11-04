@@ -12,6 +12,8 @@ use base64::Engine;
 pub struct PathMap {
     pub container: String,
     pub host: String,
+    /// The only directories send_* reads from.
+    pub send_dirs: Vec<PathBuf>,
 }
 
 impl PathMap {
@@ -70,8 +72,16 @@ pub fn outgoing(paths: &PathMap, media_path: &str, content_base64: &str, filenam
             bail!("media_path or content_base64 is required");
         }
         let path = paths.to_container(media_path);
-        let data = std::fs::read(&path).map_err(|e| anyhow::anyhow!("Media file not found: {path}: {e}"))?;
-        let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut file = std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("Media file not found: {path}: {e}"))?;
+        // Checked on the file already open, so a path swapped after the check
+        // cannot redirect the read.
+        let real = opened_path(&file).or_else(|_| std::fs::canonicalize(&path))?;
+        if !sendable(paths, &real) {
+            bail!("{path} is outside the directories files can be sent from");
+        }
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut data)?;
+        let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         return Ok(Outgoing { data, name });
     }
     let name = Path::new(filename).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -82,12 +92,37 @@ pub fn outgoing(paths: &PathMap, media_path: &str, content_base64: &str, filenam
     Ok(Outgoing { data, name })
 }
 
+/// Where an open file really is, symlinks resolved.
+fn opened_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// SQLite files: the session keys and the history.
+pub fn is_database(name: &str) -> bool {
+    [".db", ".db-wal", ".db-shm", ".db-journal"].iter().any(|ext| name.ends_with(ext))
+}
+
+/// A path the model was told to send must not reach the session keys or the
+/// history: only files under the send dirs, never a database, never a file in
+/// the store root, where the databases live. `real` is already canonical.
+fn sendable(paths: &PathMap, real: &Path) -> bool {
+    if is_database(&real.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()) {
+        return false;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).ok();
+    if canon(Path::new(&paths.container)).is_some_and(|store| real.parent() == Some(store.as_path())) {
+        return false;
+    }
+    paths.send_dirs.iter().filter_map(|d| canon(d)).any(|d| real.starts_with(d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn map() -> PathMap {
-        PathMap { container: "/app/store".into(), host: "/host/store".into() }
+        PathMap { container: "/app/store".into(), host: "/host/store".into(), send_dirs: vec![] }
     }
 
     #[test]
@@ -121,6 +156,34 @@ mod tests {
     fn download_path_is_unique_per_message_and_cannot_escape() {
         let p = download_path(Path::new("/s"), "55@s.whatsapp.net", "AB/../C", "../../etc/passwd");
         assert_eq!(p, PathBuf::from("/s/55@s.whatsapp.net/AB____C-passwd"));
+    }
+
+    #[test]
+    fn sends_only_from_send_dirs_and_never_databases() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        let chat = store.join("55@s.whatsapp.net");
+        let envios = root.path().join("envios");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::create_dir_all(&envios).unwrap();
+        for f in [store.join("whatsapp-rs.db"), store.join("notes.txt"), chat.join("x.jpg"), chat.join("y.db-wal"), envios.join("a.png")] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        std::fs::write(root.path().join("secret.txt"), b"x").unwrap();
+        let m = PathMap { container: store.to_string_lossy().into(), host: String::new(), send_dirs: vec![store.clone(), envios.clone()] };
+        let path = |p: PathBuf| p.to_string_lossy().into_owned();
+        assert!(outgoing(&m, &path(chat.join("x.jpg")), "", "").is_ok());
+        assert!(outgoing(&m, &path(envios.join("a.png")), "", "").is_ok());
+        for bad in [
+            store.join("whatsapp-rs.db"),
+            store.join("notes.txt"),
+            chat.join("y.db-wal"),
+            root.path().join("secret.txt"),
+            chat.join("../whatsapp-rs.db"),
+            envios.join("../secret.txt"),
+        ] {
+            assert!(outgoing(&m, &path(bad.clone()), "", "").is_err(), "{}", bad.display());
+        }
     }
 
     #[test]

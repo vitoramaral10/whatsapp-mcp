@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::media::{self, PathMap};
 use crate::store::{format_message, format_messages, parse_ts, MessageFilter, Store};
+use crate::embed::Embedder;
 use crate::transcribe::{Outcome, Transcriber};
 use crate::wa::Wa;
 
@@ -23,6 +24,15 @@ pub struct Ctx {
     pub transcriber: Option<Arc<Transcriber>>,
     /// Above this size download_media returns only the path.
     pub max_inline: u64,
+    /// Semantic half of search_messages; without it the search is full-text only.
+    pub embedder: Option<Arc<Embedder>>,
+    /// Hides the send tools: whatever a message says, the model cannot answer it.
+    pub read_only: bool,
+}
+
+/// A recipient as the full JID the allowlist holds.
+fn jid_of(recipient: &str) -> String {
+    if recipient.contains('@') { recipient.to_string() } else { format!("{recipient}@s.whatsapp.net") }
 }
 
 #[derive(Clone)]
@@ -164,8 +174,32 @@ pub struct SendMessageArgs {
     /// The recipient - either a phone number with country code but no + or other symbols,
     /// or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
     recipient: String,
-    /// The message text to send
+    /// The message text to send. To mention someone in a group, write @ followed by their
+    /// phone number with country code (e.g. "@5511999999999"); WhatsApp shows their name.
     message: String,
+    /// Optional ID of a message in this chat to reply to; it appears quoted above the reply
+    #[serde(default)]
+    reply_to_message_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SearchArgs {
+    /// What to look for, in any words: matches by meaning as well as by the words themselves
+    query: String,
+    /// Optional chat JID to search only that chat
+    chat_jid: Option<String>,
+    /// Optional phone number to only match messages from that sender
+    sender_phone_number: Option<String>,
+    /// Optional ISO-8601 formatted string to only return messages after this date
+    after: Option<String>,
+    /// Optional ISO-8601 formatted string to only return messages before this date
+    before: Option<String>,
+    /// Maximum number of messages to return (default 20)
+    #[serde(default = "d20")]
+    limit: u32,
+    /// Page number for pagination (default 0)
+    #[serde(default)]
+    page: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -184,6 +218,9 @@ pub struct SendFileArgs {
     /// as the document name (e.g. "relatorio.pdf")
     #[serde(default)]
     filename: String,
+    /// Optional ID of a message in this chat to reply to
+    #[serde(default)]
+    reply_to_message_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -220,7 +257,13 @@ fn status(result: anyhow::Result<String>) -> R {
 #[tool_router]
 impl Server {
     pub fn new(ctx: Arc<Ctx>) -> Self {
-        Self { ctx, tool_router: Self::tool_router() }
+        let mut tool_router = Self::tool_router();
+        if ctx.read_only {
+            for name in ["send_message", "send_file", "send_audio_message"] {
+                tool_router.remove_route(name);
+            }
+        }
+        Self { ctx, tool_router }
     }
 
     #[tool(description = "Search WhatsApp contacts by name or phone number.")]
@@ -256,6 +299,31 @@ impl Server {
             }
         }
         text(format_messages(s, &all))
+    }
+
+    #[tool(description = "Search WhatsApp messages by meaning and by words at once (semantic + full-text, ranked best match first). Prefer this over list_messages' query for questions like \"when did we talk about the trip\": it finds the messages even when they use other words.")]
+    async fn search_messages(&self, Parameters(a): Parameters<SearchArgs>) -> R {
+        let s = &self.ctx.store;
+        let filter = MessageFilter {
+            after: iso(&a.after, "after")?,
+            before: iso(&a.before, "before")?,
+            sender: a.sender_phone_number.filter(|v| !v.is_empty()),
+            chat_jid: a.chat_jid.filter(|v| !v.is_empty()),
+            query: None,
+            limit: a.limit,
+            page: a.page,
+        };
+        let qvec = match &self.ctx.embedder {
+            Some(e) => match e.embed_one(&a.query).await {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log::warn!("semantic search unavailable, full-text only: {err:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        text(format_messages(s, &s.search(&a.query, qvec.as_deref(), &filter).map_err(internal)?))
     }
 
     #[tool(description = "Get WhatsApp chats matching specified criteria.")]
@@ -305,7 +373,10 @@ impl Server {
         if a.recipient.is_empty() {
             return status(Err(anyhow::anyhow!("Recipient must be provided")));
         }
-        status(self.ctx.wa.send(&a.recipient, &a.message, None, false).await)
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
+        }
+        status(self.ctx.wa.send(&a.recipient, &a.message, None, false, a.reply_to_message_id.as_deref()).await)
     }
 
     #[tool(description = "Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.\n\nReturns a dictionary containing success status and a status message")]
@@ -320,6 +391,9 @@ impl Server {
 
     #[tool(description = "Download media from a WhatsApp message and return its content.\n\nReturns a JSON text block with success status, message, file_path, mime_type and size_bytes (plus transcription, transcription_pending or transcription_error for audio), followed by the file itself: an image block for pictures, an embedded resource (base64 blob) for everything else. Files over the inline limit come back as path only.")]
     async fn download_media(&self, Parameters(a): Parameters<DownloadArgs>) -> R {
+        if !self.ctx.store.allowed(&a.chat_jid) {
+            return json_out(json!({ "success": false, "message": "Chat is not in the allowed chats" }));
+        }
         let (_, path) = match self.ctx.wa.download(&a.message_id, &a.chat_jid).await {
             Ok(r) => r,
             Err(e) => {
@@ -365,15 +439,46 @@ impl Server {
         if a.recipient.is_empty() {
             anyhow::bail!("Recipient must be provided");
         }
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            anyhow::bail!("{} is not in the allowed chats", a.recipient);
+        }
         let file = media::outgoing(&self.ctx.paths, &a.media_path, &a.content_base64, &a.filename)
             .map_err(|e| anyhow::anyhow!("Invalid file content: {e:#}"))?;
-        self.ctx.wa.send(&a.recipient, "", Some(file), voice).await
+        self.ctx.wa.send(&a.recipient, "", Some(file), voice, a.reply_to_message_id.as_deref()).await
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(read_only: bool) -> (tempfile::TempDir, Server) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("messages.db")).unwrap());
+        let wa = Wa::new(Arc::clone(&store), dir.path().to_path_buf());
+        let ctx = Ctx { store, wa, paths: PathMap::default(), transcriber: None, max_inline: 0, embedder: None, read_only };
+        (dir, Server::new(Arc::new(ctx)))
+    }
+
+    #[test]
+    fn read_only_hides_exactly_the_send_tools() {
+        let names = |s: &Server| {
+            let mut n: Vec<String> = s.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+            n.sort();
+            n
+        };
+        let (_a, full) = server(false);
+        let (_b, ro) = server(true);
+        assert_eq!(names(&full).len(), 13);
+        assert!(names(&full).contains(&"search_messages".to_string()));
+        let hidden: Vec<String> = names(&full).into_iter().filter(|n| !names(&ro).contains(n)).collect();
+        assert_eq!(hidden, ["send_audio_message", "send_file", "send_message"]);
     }
 }

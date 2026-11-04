@@ -3,6 +3,7 @@
 //! services on the network use to send messages.
 
 mod audio;
+mod embed;
 mod extract;
 mod mcp;
 mod media;
@@ -60,9 +61,21 @@ async fn run() -> Result<()> {
         }
     }
 
+    let allowed: Vec<String> = env("WHATSAPP_ALLOWED_CHATS", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| if c.contains('@') { c.to_string() } else { format!("{c}@s.whatsapp.net") })
+        .collect();
+    if !allowed.is_empty() {
+        store.restrict(&allowed)?;
+        info!("MCP tools limited to {} chats", allowed.len());
+    }
+
     let wa = wa::Wa::new(Arc::clone(&store), store_dir.clone());
     let pair_phone = Some(env("WHATSAPP_PAIR_PHONE", "")).filter(|p| !p.is_empty());
     wa.start(&store_dir.join(env("WHATSAPP_SESSION_DB", "whatsapp-rs.db")), pair_phone).await?;
+    lock_down(&store_dir);
 
     let whisper = env("WHISPER_URL", "");
     let transcriber = (!whisper.is_empty()).then(|| {
@@ -72,15 +85,24 @@ async fn run() -> Result<()> {
             Duration::from_secs_f64(env("WHISPER_TIMEOUT_S", "180").parse().unwrap_or(180.0)),
         )
     });
+    let embed_url = env("EMBED_URL", "");
+    let embedder = (!embed_url.is_empty()).then(|| embed::Embedder::new(embed_url, env("EMBED_MODEL", "bge-m3")));
+    if let Some(e) = &embedder {
+        tokio::spawn(Arc::clone(e).backfill(Arc::clone(&store)));
+    }
+    let read_only = matches!(env("WHATSAPP_READ_ONLY", "").to_lowercase().as_str(), "1" | "true" | "yes");
     let ctx = Arc::new(mcp::Ctx {
         store,
         wa: Arc::clone(&wa),
         paths: media::PathMap {
             container: store_dir.to_string_lossy().into_owned(),
             host: env("WHATSAPP_MEDIA_HOST_PATH", ""),
+            send_dirs: std::env::split_paths(&env("WHATSAPP_SEND_DIRS", &store_dir.to_string_lossy())).collect(),
         },
         transcriber,
         max_inline: env("WHATSAPP_MEDIA_MAX_INLINE_BYTES", "8388608").parse().unwrap_or(8 << 20),
+        embedder,
+        read_only,
     });
 
     let mcp_ctx = Arc::clone(&ctx);
@@ -108,6 +130,23 @@ async fn run() -> Result<()> {
         _ = shutdown() => info!("shutting down"),
     }
     Ok(())
+}
+
+/// The store holds the session keys and the whole history: owner only. SQLite
+/// gives the -wal and -shm files it creates later the database's own mode.
+fn lock_down(store_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let set = |p: &std::path::Path, mode: u32| {
+        if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)) {
+            log::warn!("chmod {mode:o} {}: {e}", p.display());
+        }
+    };
+    set(store_dir, 0o700);
+    for entry in std::fs::read_dir(store_dir).into_iter().flatten().flatten() {
+        if entry.path().is_file() && media::is_database(&entry.file_name().to_string_lossy()) {
+            set(&entry.path(), 0o600);
+        }
+    }
 }
 
 async fn shutdown() {
@@ -141,7 +180,7 @@ async fn api_send(State(ctx): State<Arc<mcp::Ctx>>, Json(req): Json<SendRequest>
         } else {
             Some(media::outgoing(&ctx.paths, &req.media_path, "", "")?)
         };
-        ctx.wa.send(&req.recipient, &req.message, file, false).await
+        ctx.wa.send(&req.recipient, &req.message, file, false, None).await
     }
     .await;
     match result {

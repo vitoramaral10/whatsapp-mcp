@@ -44,8 +44,12 @@ printed 8-character code under *Link with phone number* instead.
 | `WHATSAPP_PAIR_PHONE` | — | Pair with a code instead of a QR |
 | `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | MCP listener |
 | `WHATSAPP_API_PORT` | `8080` | REST API listener |
+| `WHATSAPP_SEND_DIRS` | store dir | `:`-separated directories `send_file` and `/api/send` may read from; databases and files in the store root are always refused |
 | `WHATSAPP_MEDIA_HOST_PATH` | — | Host side of the store bind mount, so returned paths open on the host |
 | `WHATSAPP_MEDIA_MAX_INLINE_BYTES` | `8388608` | Larger media come back as a path only |
+| `WHATSAPP_READ_ONLY` | — | `true` hides the send tools from MCP clients (the REST API still sends) |
+| `WHATSAPP_ALLOWED_CHATS` | — | `,`-separated JIDs or phone numbers: the MCP tools read, download and send only in these chats; the history still records every chat, and the REST API, meant for services on a private network, is not limited |
+| `EMBED_URL` / `EMBED_MODEL` | — / `bge-m3` | OpenAI-compatible `/v1/embeddings` server (e.g. `llama-server --embedding`); enables the semantic half of `search_messages` |
 | `WHISPER_URL` | — | whisper.cpp server; voice notes get a transcript |
 | `WHISPER_WAIT_S` / `WHISPER_TIMEOUT_S` | `10` / `180` | How long a call waits for the transcript / per-run limit |
 | `WHATSAPP_LOG_LEVEL` | `info` | Log level of the WhatsApp library |
@@ -57,14 +61,21 @@ over, so the device has to be paired again.
 ## MCP tools
 
 - **search_contacts**: contacts by name or phone number
-- **list_messages**: messages with filters (date, sender, chat, text) and surrounding context
+- **search_messages**: best matches first, by meaning (embeddings) and by words (SQLite FTS5),
+  merged by reciprocal rank; full-text only when no embedding server is set
+- **list_messages**: messages with filters (date, sender, chat, words via FTS5) and surrounding context
 - **list_chats**, **get_chat**, **get_direct_chat_by_contact**, **get_contact_chats**
 - **get_last_interaction**, **get_message_context**
-- **send_message**: text to a phone number or JID
-- **send_file**: image, video or document, from a path in the store or `content_base64` + `filename`
+- **send_message**: text to a phone number or JID; `reply_to_message_id` quotes a message, and
+  every `@<phone number>` in the text becomes a mention
+- **send_file**: image, video or document, from a path in the send dirs or `content_base64` + `filename`
 - **send_audio_message**: any decodable audio sent as an Opus voice note
 - **download_media**: the file itself (image block or embedded resource) plus metadata; voice
   notes also carry `transcription`, or `transcription_pending` while whisper is still running
+
+Edits rewrite the stored message (`[edited] ` prefix), deletions keep the text under a
+`[deleted] ` prefix, and reactions are stored as their own line quoting the message. Media whose
+CDN copy expired is requested again from the phone, which must be online for that.
 
 ## Development
 
@@ -72,8 +83,9 @@ over, so the device has to be paired again.
 cargo test
 ```
 
-Tests cover the history store against the Go bridge's format, message text extraction
-(menus, polls, wrappers), audio decode/encode, media paths and the transcription cache.
+Tests cover the history store against the Go bridge's format, full-text and hybrid search, the
+chat allowlist, message text extraction (menus, polls, wrappers, edits, reactions), mentions,
+read-only mode, audio decode/encode, media paths and the transcription cache.
 
 ## License
 
