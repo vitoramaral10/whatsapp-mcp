@@ -183,6 +183,24 @@ pub struct SendMessageArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct EditMessageArgs {
+    /// The chat the message was sent to: a phone number with country code or a JID
+    recipient: String,
+    /// The ID of a text message you sent
+    message_id: String,
+    /// The new text
+    message: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeleteMessageArgs {
+    /// The chat the message was sent to: a phone number with country code or a JID
+    recipient: String,
+    /// The ID of a message you sent
+    message_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// What to look for, in any words: matches by meaning as well as by the words themselves
     query: String,
@@ -259,7 +277,7 @@ impl Server {
     pub fn new(ctx: Arc<Ctx>) -> Self {
         let mut tool_router = Self::tool_router();
         if ctx.read_only {
-            for name in ["send_message", "send_file", "send_audio_message"] {
+            for name in ["send_message", "send_file", "send_audio_message", "edit_message", "delete_message"] {
                 tool_router.remove_route(name);
             }
         }
@@ -379,6 +397,22 @@ impl Server {
         status(self.ctx.wa.send(&a.recipient, &a.message, None, false, a.reply_to_message_id.as_deref()).await)
     }
 
+    #[tool(description = "Edit the text of a WhatsApp text message you sent. WhatsApp only accepts edits in the first 15 minutes or so after sending.\n\nReturns a dictionary containing success status and a status message")]
+    async fn edit_message(&self, Parameters(a): Parameters<EditMessageArgs>) -> R {
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
+        }
+        status(self.ctx.wa.edit(&a.recipient, &a.message_id, &a.message).await)
+    }
+
+    #[tool(description = "Delete a WhatsApp message you sent, for everyone in the chat.\n\nReturns a dictionary containing success status and a status message")]
+    async fn delete_message(&self, Parameters(a): Parameters<DeleteMessageArgs>) -> R {
+        if !self.ctx.store.allowed(&jid_of(&a.recipient)) {
+            return status(Err(anyhow::anyhow!("{} is not in the allowed chats", a.recipient)));
+        }
+        status(self.ctx.wa.delete(&a.recipient, &a.message_id).await)
+    }
+
     #[tool(description = "Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.\n\nReturns a dictionary containing success status and a status message")]
     async fn send_file(&self, Parameters(a): Parameters<SendFileArgs>) -> R {
         status(self.send_outgoing(&a, false).await)
@@ -468,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_hides_exactly_the_send_tools() {
+    fn read_only_hides_exactly_the_tools_that_write() {
         let names = |s: &Server| {
             let mut n: Vec<String> = s.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
             n.sort();
@@ -476,9 +510,9 @@ mod tests {
         };
         let (_a, full) = server(false);
         let (_b, ro) = server(true);
-        assert_eq!(names(&full).len(), 13);
+        assert_eq!(names(&full).len(), 15);
         assert!(names(&full).contains(&"search_messages".to_string()));
         let hidden: Vec<String> = names(&full).into_iter().filter(|n| !names(&ro).contains(n)).collect();
-        assert_eq!(hidden, ["send_audio_message", "send_file", "send_message"]);
+        assert_eq!(hidden, ["delete_message", "edit_message", "send_audio_message", "send_file", "send_message"]);
     }
 }

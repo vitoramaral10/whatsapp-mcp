@@ -47,7 +47,7 @@ printed 8-character code under *Link with phone number* instead.
 | `WHATSAPP_SEND_DIRS` | store dir | `:`-separated directories `send_file` and `/api/send` may read from; databases and files in the store root are always refused |
 | `WHATSAPP_MEDIA_HOST_PATH` | — | Host side of the store bind mount, so returned paths open on the host |
 | `WHATSAPP_MEDIA_MAX_INLINE_BYTES` | `8388608` | Larger media come back as a path only |
-| `WHATSAPP_READ_ONLY` | — | `true` hides the send tools from MCP clients (the REST API still sends) |
+| `WHATSAPP_READ_ONLY` | — | `true` hides the send, edit and delete tools from MCP clients (the REST API still sends) |
 | `WHATSAPP_ALLOWED_CHATS` | — | `,`-separated JIDs or phone numbers: the MCP tools read, download and send only in these chats; the history still records every chat, and the REST API, meant for services on a private network, is not limited |
 | `EMBED_URL` / `EMBED_MODEL` | — / `bge-m3` | OpenAI-compatible `/v1/embeddings` server (e.g. `llama-server --embedding`); enables the semantic half of `search_messages` |
 | `WHISPER_URL` | — | whisper.cpp server; voice notes get a transcript |
@@ -70,6 +70,8 @@ over, so the device has to be paired again.
   every `@<phone number>` in the text becomes a mention
 - **send_file**: image, video or document, from a path in the send dirs or `content_base64` + `filename`
 - **send_audio_message**: any decodable audio sent as an Opus voice note
+- **edit_message**, **delete_message**: rewrite (text only, within WhatsApp's ~15 min window)
+  or delete for everyone a message you sent
 - **download_media**: the file itself (image block or embedded resource) plus metadata; voice
   notes also carry `transcription`, or `transcription_pending` while whisper is still running
 

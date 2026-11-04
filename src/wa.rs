@@ -330,11 +330,7 @@ impl Wa {
         if !client.is_connected() {
             bail!("Not connected to WhatsApp");
         }
-        let to: Jid = if recipient.contains('@') {
-            recipient.parse().map_err(|e| anyhow!("Error parsing JID: {e:?}"))?
-        } else {
-            Jid::new(recipient, Server::Pn)
-        };
+        let to = parse_recipient(recipient)?;
         let chat = self.canonical(&to).await;
         let context = self.context_info(client, &chat, text, reply_to)?;
         let msg = match file {
@@ -361,6 +357,43 @@ impl Wa {
             warn!("failed to store sent message: {e:#}");
         }
         Ok(format!("Message sent to {recipient}"))
+    }
+
+    /// Rewrites the text of a message you sent; WhatsApp accepts this only in
+    /// the first 15 minutes or so.
+    pub async fn edit(&self, recipient: &str, id: &str, text: &str) -> Result<String> {
+        let (client, to, chat) = self.own_message(recipient, id, true).await?;
+        let msg = wa::Message { conversation: Some(text.to_string()), ..Default::default() };
+        client.edit_message(to, id, msg).await.map_err(|e| anyhow!("Error editing message: {e}"))?;
+        self.store.edit_message(id, &chat, text)?;
+        Ok(format!("Message {id} edited"))
+    }
+
+    /// Deletes a message you sent for everyone in the chat.
+    pub async fn delete(&self, recipient: &str, id: &str) -> Result<String> {
+        let (client, to, chat) = self.own_message(recipient, id, false).await?;
+        client.revoke_message(to, id, whatsapp_rust::RevokeType::Sender).await.map_err(|e| anyhow!("Error deleting message: {e}"))?;
+        self.store.revoke_message(id, &chat)?;
+        Ok(format!("Message {id} deleted"))
+    }
+
+    /// The client, the JID to send to and the stored chat of a message of
+    /// ours: WhatsApp would refuse the edit of anyone else's message anyway.
+    async fn own_message(&self, recipient: &str, id: &str, text_only: bool) -> Result<(&Arc<Client>, Jid, String)> {
+        let client = self.client()?;
+        if !client.is_connected() {
+            bail!("Not connected to WhatsApp");
+        }
+        let to = parse_recipient(recipient)?;
+        let chat = self.canonical(&to).await.to_string();
+        let (media, from_me, _) = self.store.media(id, &chat)?.ok_or_else(|| anyhow!("message {id} is not in this chat"))?;
+        if !from_me {
+            bail!("message {id} was not sent by you");
+        }
+        if text_only && !media.kind.is_empty() {
+            bail!("only text messages can be edited");
+        }
+        Ok((client, to, chat))
     }
 
     /// Mentions (every "@<phone number>" in the text) and the quoted message of
@@ -559,6 +592,14 @@ impl Wa {
 }
 
 /// JIDs for every "@<phone number>" in the text.
+fn parse_recipient(recipient: &str) -> Result<Jid> {
+    if recipient.contains('@') {
+        recipient.parse().map_err(|e| anyhow!("Error parsing JID: {e:?}"))
+    } else {
+        Ok(Jid::new(recipient, Server::Pn))
+    }
+}
+
 fn mentions(text: &str) -> Vec<String> {
     text.split('@')
         .skip(1)
