@@ -47,16 +47,29 @@ fn s(o: &Option<String>) -> &str {
     o.as_deref().unwrap_or("")
 }
 
+/// "[tag] first line\n...", or the bare tag when there is nothing else.
+fn tagged(tag: &str, b: Lines) -> String {
+    b.done().map_or_else(|| tag.to_string(), |t| format!("{tag} {t}"))
+}
+
+/// The message a view-once wrapper holds.
+fn view_once(m: &wa::Message) -> Option<&wa::Message> {
+    [&m.view_once_message, &m.view_once_message_v2, &m.view_once_message_v2_extension]
+        .into_iter()
+        .find_map(|f| f.as_option().and_then(|f| f.message.as_option()))
+}
+
 /// The messages a container wraps, innermost payload one level down.
 fn inner(m: &wa::Message) -> impl Iterator<Item = &wa::Message> {
     [
         m.ephemeral_message.as_option().and_then(|f| f.message.as_option()),
-        m.view_once_message.as_option().and_then(|f| f.message.as_option()),
-        m.view_once_message_v2.as_option().and_then(|f| f.message.as_option()),
-        m.view_once_message_v2_extension.as_option().and_then(|f| f.message.as_option()),
+        view_once(m),
         m.document_with_caption_message.as_option().and_then(|f| f.message.as_option()),
         m.edited_message.as_option().and_then(|f| f.message.as_option()),
         m.device_sent_message.as_option().and_then(|f| f.message.as_option()),
+        m.lottie_sticker_message.as_option().and_then(|f| f.message.as_option()),
+        m.associated_child_message.as_option().and_then(|f| f.message.as_option()),
+        m.group_mentioned_message.as_option().and_then(|f| f.message.as_option()),
     ]
     .into_iter()
     .flatten()
@@ -70,6 +83,10 @@ fn text_depth(m: &wa::Message, depth: u8) -> Option<String> {
     // Guards against a malformed message nesting containers forever.
     if depth > 4 {
         return None;
+    }
+    // Marked, so the history says the media was meant to be seen once.
+    if let Some(v) = view_once(m) {
+        return Some(text_depth(v, depth + 1).map_or_else(|| "[view-once]".into(), |t| format!("[view-once] {t}")));
     }
     if let Some(t) = inner(m).find_map(|i| text_depth(i, depth + 1)) {
         return Some(t);
@@ -149,10 +166,10 @@ fn text_depth(m: &wa::Message, depth: u8) -> Option<String> {
             return Some(t.to_string());
         }
     }
-    if let Some(r) = m.template_button_reply_message.as_option() {
-        if let Some(t) = [s(&r.selected_display_text), s(&r.selected_id)].into_iter().find(|t| !t.is_empty()) {
-            return Some(t.to_string());
-        }
+    if let Some(r) = m.template_button_reply_message.as_option()
+        && let Some(t) = [s(&r.selected_display_text), s(&r.selected_id)].into_iter().find(|t| !t.is_empty())
+    {
+        return Some(t.to_string());
     }
     if let Some(r) = m.interactive_response_message.as_option() {
         use wa::message::interactive_response_message::InteractiveResponseMessage as Kind;
@@ -182,24 +199,58 @@ fn text_depth(m: &wa::Message, depth: u8) -> Option<String> {
             b.add(bullet(s(&o.option_name), "", ""));
         }
         if let Some(t) = b.done() {
-            return Some(t);
+            return Some(format!("[poll] {t}"));
         }
     }
     // A clinic asked for its address answers with a pin or a vCard.
+    let coords = |lat: Option<f64>, lon: Option<f64>| match (lat, lon) {
+        (Some(lat), Some(lon)) => format!("{lat:.6}, {lon:.6}"),
+        _ => String::new(),
+    };
     if let Some(l) = m.location_message.as_option() {
         let mut b = Lines::default();
         b.add(s(&l.name));
         b.add(s(&l.address));
-        b.add(format!("{:.6}, {:.6}", l.degrees_latitude.unwrap_or(0.0), l.degrees_longitude.unwrap_or(0.0)));
-        return b.done();
+        b.add(coords(l.degrees_latitude, l.degrees_longitude));
+        return Some(tagged("[location]", b));
+    }
+    if let Some(l) = m.live_location_message.as_option() {
+        let mut b = Lines::default();
+        b.add(s(&l.caption));
+        b.add(coords(l.degrees_latitude, l.degrees_longitude));
+        return Some(tagged("[live location]", b));
     }
     if let Some(c) = m.contact_message.as_option() {
         let mut b = Lines::default();
         b.add(s(&c.display_name));
         b.add(s(&c.vcard));
-        if let Some(t) = b.done() {
-            return Some(t);
+        return Some(tagged("[contact]", b));
+    }
+    if let Some(c) = m.contacts_array_message.as_option() {
+        let mut b = Lines::default();
+        b.add(s(&c.display_name));
+        for x in &c.contacts {
+            b.add(s(&x.display_name));
+            b.add(s(&x.vcard));
         }
+        return Some(tagged("[contact]", b));
+    }
+    if let Some(g) = m.group_invite_message.as_option() {
+        let mut b = Lines::default();
+        b.add(s(&g.group_name));
+        b.add(s(&g.caption));
+        return Some(tagged("[group invite]", b));
+    }
+    if let Some(e) = m.event_message.as_option() {
+        let mut b = Lines::default();
+        b.add(s(&e.name));
+        b.add(s(&e.description));
+        if let Some(start) = e.start_time.and_then(|t| DateTime::from_timestamp(t, 0)) {
+            b.add(start.format("%Y-%m-%d %H:%M UTC").to_string());
+        }
+        b.add(e.location.as_option().map(|l| s(&l.name)).unwrap_or(""));
+        b.add(s(&e.join_link));
+        return Some(tagged(if e.is_canceled == Some(true) { "[event cancelled]" } else { "[event]" }, b));
     }
     None
 }
@@ -276,15 +327,21 @@ fn native_flow_button(name: &str, raw: &str) -> String {
     b.done().unwrap_or_else(|| bullet(name, "", ""))
 }
 
-/// The attachment, if any. The filename is derived from the message time so a
-/// replayed message gets the same name.
 /// A message that changes an earlier one instead of saying something new.
 #[derive(Debug, PartialEq)]
 pub enum Change {
-    Edit { id: String, text: String },
-    Revoke { id: String },
+    Edit {
+        id: String,
+        text: String,
+    },
+    Revoke {
+        id: String,
+    },
     /// An empty emoji takes the reaction back.
-    React { id: String, emoji: String },
+    React {
+        id: String,
+        emoji: String,
+    },
 }
 
 pub fn change(m: &wa::Message) -> Option<Change> {
@@ -316,6 +373,8 @@ fn change_depth(m: &wa::Message, depth: u8) -> Option<Change> {
     Some(Change::React { id: r.key.as_option().and_then(target)?, emoji: s(&r.text).to_string() })
 }
 
+/// The attachment, if any. The filename is derived from the message time so a
+/// replayed message gets the same name.
 pub fn media(m: &wa::Message, ts: DateTime<Utc>) -> Media {
     media_depth(m, ts, 0)
 }
@@ -354,9 +413,8 @@ fn media_depth(m: &wa::Message, ts: DateTime<Utc>, depth: u8) -> Media {
         return media!(x, "audio", format!("audio_{stamp}.{ext}"));
     }
     if let Some(x) = m.document_message.as_option() {
-        let name = x.file_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| {
-            format!("document_{stamp}.{}", ext_for(s(&x.mimetype), "bin"))
-        });
+        let name =
+            x.file_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("document_{stamp}.{}", ext_for(s(&x.mimetype), "bin")));
         return media!(x, "document", name);
     }
     if let Some(x) = m.sticker_message.as_option() {
@@ -374,10 +432,9 @@ fn ext_for(mime: &str, default: &str) -> String {
         "audio/ogg" | "audio/opus" => "ogg".into(),
         "audio/mpeg" => "mp3".into(),
         "audio/mp4" | "audio/aac" | "audio/x-m4a" => "m4a".into(),
-        other => mime_guess::get_mime_extensions_str(other)
-            .and_then(|e| e.first())
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| default.into()),
+        other => {
+            mime_guess::get_mime_extensions_str(other).and_then(|e| e.first()).map(|e| e.to_string()).unwrap_or_else(|| default.into())
+        }
     }
 }
 
@@ -411,10 +468,7 @@ mod tests {
         let plain = wa::Message { conversation: Some("oi".into()), ..Default::default() };
         assert_eq!(text(&plain), "oi");
         let wrapped = wa::Message {
-            ephemeral_message: MessageField::some(wa::message::FutureProofMessage {
-                message: MessageField::some(plain.clone()),
-                ..Default::default()
-            }),
+            ephemeral_message: MessageField::some(wa::message::FutureProofMessage { message: MessageField::some(plain.clone()) }),
             ..Default::default()
         };
         assert_eq!(text(&wrapped), "oi");
@@ -434,7 +488,10 @@ mod tests {
         };
         assert_eq!(text(&m), "olha");
         let media = media(&m, ts());
-        assert_eq!((media.kind.as_str(), media.filename.as_str(), media.direct_path.as_str()), ("image", "image_20261103_140232.png", "/v/x"));
+        assert_eq!(
+            (media.kind.as_str(), media.filename.as_str(), media.direct_path.as_str()),
+            ("image", "image_20261103_140232.png", "/v/x")
+        );
     }
 
     #[test]
@@ -457,14 +514,17 @@ mod tests {
         let edit = wa::Message {
             edited_message: MessageField::some(wa::message::FutureProofMessage {
                 message: MessageField::some(protocol(Type::MESSAGE_EDIT, Some("novo"))),
-                ..Default::default()
             }),
             ..Default::default()
         };
         assert_eq!(change(&edit), Some(Change::Edit { id: "T1".into(), text: "novo".into() }));
         assert_eq!(text(&edit), "");
         let react = wa::Message {
-            reaction_message: MessageField::some(wa::message::ReactionMessage { key: key(), text: Some("👍".into()), ..Default::default() }),
+            reaction_message: MessageField::some(wa::message::ReactionMessage {
+                key: key(),
+                text: Some("👍".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert_eq!(change(&react), Some(Change::React { id: "T1".into(), emoji: "👍".into() }));
@@ -475,7 +535,10 @@ mod tests {
     #[test]
     fn voice_note_document_and_sticker_names() {
         let audio = wa::Message {
-            audio_message: MessageField::some(wa::message::AudioMessage { mimetype: Some("audio/ogg; codecs=opus".into()), ..Default::default() }),
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                mimetype: Some("audio/ogg; codecs=opus".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         assert_eq!(media(&audio, ts()).filename, "audio_20261103_140232.ogg");
@@ -495,8 +558,11 @@ mod tests {
                 title: Some("Menu".into()),
                 sections: vec![wa::message::list_message::Section {
                     title: Some("Opções".into()),
-                    rows: vec![wa::message::list_message::Row { title: Some("Endereço".into()), row_id: Some("1".into()), ..Default::default() }],
-                    ..Default::default()
+                    rows: vec![wa::message::list_message::Row {
+                        title: Some("Endereço".into()),
+                        row_id: Some("1".into()),
+                        ..Default::default()
+                    }],
                 }],
                 ..Default::default()
             }),
@@ -505,6 +571,64 @@ mod tests {
         assert_eq!(text(&list), "Menu\nOpções\n- Endereço [1]");
         assert_eq!(native_flow_button("quick_reply", r#"{"display_text":"Sim","id":"y"}"#), "- Sim [y]");
         assert_eq!(native_flow_button("x", "{bad"), "- x: {bad");
+    }
+
+    #[test]
+    fn shared_things_are_tagged() {
+        let pin = |lat: Option<f64>| wa::Message {
+            location_message: MessageField::some(wa::message::LocationMessage {
+                name: Some("Clínica".into()),
+                degrees_latitude: lat,
+                degrees_longitude: Some(-46.6),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&pin(Some(-23.5))), "[location] Clínica\n-23.500000, -46.600000");
+        assert_eq!(text(&pin(None)), "[location] Clínica", "no coordinates, no 0.0");
+        let contacts = wa::Message {
+            contacts_array_message: MessageField::some(wa::message::ContactsArrayMessage {
+                contacts: vec![wa::message::ContactMessage { display_name: Some("Ana".into()), ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&contacts), "[contact] Ana");
+        let poll = wa::Message {
+            poll_creation_message: MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Pizza?".into()),
+                options: vec![wa::message::poll_creation_message::Option { option_name: Some("Sim".into()), ..Default::default() }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&poll), "[poll] Pizza?\n- Sim");
+        let caption = wa::message::ImageMessage { caption: Some("olha".into()), ..Default::default() };
+        let once = |image: wa::message::ImageMessage| wa::Message {
+            view_once_message_v2: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message { image_message: MessageField::some(image), ..Default::default() }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&once(caption)), "[view-once] olha");
+        assert_eq!(text(&once(Default::default())), "[view-once]");
+        assert_eq!(media(&once(Default::default()), ts()).kind, "image");
+        let event = wa::Message {
+            event_message: MessageField::some(wa::message::EventMessage {
+                name: Some("Churrasco".into()),
+                start_time: Some(1_793_800_800),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&event), "[event] Churrasco\n2026-11-04 14:00 UTC");
+        let mentioned = wa::Message {
+            group_mentioned_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message { conversation: Some("oi".into()), ..Default::default() }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(text(&mentioned), "oi");
     }
 
     #[test]

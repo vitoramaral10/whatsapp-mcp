@@ -5,9 +5,16 @@
 
 use std::io::Cursor;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 const OPUS_RATE: u32 = 48_000;
+/// Longest audio decoded. Voice notes from anyone are decoded on arrival, and
+/// a few KB of crafted Opus or FLAC can otherwise expand into gigabytes of PCM.
+pub const MAX_SECONDS: u64 = 30 * 60;
+/// Largest input decoded at all.
+pub const MAX_BYTES: usize = 100 << 20;
+/// Above this a declared sample rate is bogus, and would defeat MAX_SECONDS.
+const MAX_RATE: u32 = 192_000;
 
 /// Mono PCM at some sample rate.
 pub struct Pcm {
@@ -25,19 +32,36 @@ pub fn is_ogg(data: &[u8]) -> bool {
     data.starts_with(b"OggS")
 }
 
+/// An Ogg stream whose first packet is an Opus header.
+pub fn is_ogg_opus(data: &[u8]) -> bool {
+    is_ogg(data) && ogg::PacketReader::new(Cursor::new(data)).read_packet().ok().flatten().is_some_and(|p| p.data.starts_with(b"OpusHead"))
+}
+
 /// Decodes any supported container to mono PCM.
 pub fn decode(data: &[u8], ext_hint: Option<&str>) -> Result<Pcm> {
-    if is_ogg(data) && find(data, b"OpusHead").is_some() {
-        return decode_ogg_opus(data);
+    decode_up_to(data, ext_hint, MAX_SECONDS)
+}
+
+fn decode_up_to(data: &[u8], ext_hint: Option<&str>, max_seconds: u64) -> Result<Pcm> {
+    if data.len() > MAX_BYTES {
+        bail!("audio is {} bytes, over the {MAX_BYTES}-byte limit", data.len());
     }
-    decode_symphonia(data, ext_hint)
+    if is_ogg_opus(data) {
+        return decode_ogg_opus(data, max_seconds);
+    }
+    decode_symphonia(data, ext_hint, max_seconds)
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Errors as soon as more than `max_seconds` of audio came out. Counts frames
+/// (mono samples after the downmix), the same as samples / channels.
+fn check_length(frames: usize, rate: u32, max_seconds: u64) -> Result<()> {
+    if frames as u64 > rate as u64 * max_seconds {
+        bail!("audio is longer than {max_seconds} seconds");
+    }
+    Ok(())
 }
 
-fn decode_ogg_opus(data: &[u8]) -> Result<Pcm> {
+fn decode_ogg_opus(data: &[u8], max_seconds: u64) -> Result<Pcm> {
     let mut reader = ogg::PacketReader::new(Cursor::new(data));
     let head = reader.read_packet()?.ok_or_else(|| anyhow!("empty ogg stream"))?;
     if !head.data.starts_with(b"OpusHead") || head.data.len() < 19 {
@@ -54,19 +78,24 @@ fn decode_ogg_opus(data: &[u8]) -> Result<Pcm> {
     while let Some(packet) = reader.read_packet()? {
         let n = decoder.decode_float(&packet.data, &mut frame, false)?;
         if channels == 2 {
-            samples.extend(frame[..n * 2].chunks_exact(2).map(|p| (p[0] + p[1]) * 0.5));
+            samples.extend(frame[..n * 2].as_chunks::<2>().0.iter().map(|[l, r]| (l + r) * 0.5));
         } else {
             samples.extend_from_slice(&frame[..n]);
         }
+        check_length(samples.len(), OPUS_RATE, max_seconds)?;
     }
     samples.drain(..pre_skip.min(samples.len()));
     Ok(Pcm { rate: OPUS_RATE, samples })
 }
 
-fn decode_symphonia(data: &[u8], ext_hint: Option<&str>) -> Result<Pcm> {
+fn decode_symphonia(data: &[u8], ext_hint: Option<&str>, max_seconds: u64) -> Result<Pcm> {
     use symphonia::core::{
-        audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
-        meta::MetadataOptions, probe::Hint,
+        audio::{SampleBuffer, SignalSpec},
+        codecs::{CODEC_TYPE_NULL, DecoderOptions},
+        formats::FormatOptions,
+        io::MediaSourceStream,
+        meta::MetadataOptions,
+        probe::Hint,
     };
     let mss = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
     let mut hint = Hint::new();
@@ -77,14 +106,20 @@ fn decode_symphonia(data: &[u8], ext_hint: Option<&str>) -> Result<Pcm> {
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .context("unsupported audio format")?;
     let mut format = probed.format;
+    // The first real audio track: default_track() may be a cover image or a null codec.
     let track = format
-        .default_track()
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL && t.codec_params.sample_rate.is_some())
         .ok_or_else(|| anyhow!("no audio track"))?
         .clone();
-    let rate = track.codec_params.sample_rate.ok_or_else(|| anyhow!("unknown sample rate"))?;
+    let rate = track.codec_params.sample_rate.unwrap_or_default();
+    if !(1..=MAX_RATE).contains(&rate) {
+        bail!("unsupported sample rate {rate}");
+    }
     let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut samples = Vec::new();
-    let mut buf: Option<SampleBuffer<f32>> = None;
+    let mut buf: Option<(SampleBuffer<f32>, SignalSpec)> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -100,13 +135,15 @@ fn decode_symphonia(data: &[u8], ext_hint: Option<&str>) -> Result<Pcm> {
             Err(e) => return Err(e.into()),
         };
         let spec = *decoded.spec();
-        let b = buf.get_or_insert_with(|| SampleBuffer::new(decoded.capacity() as u64, spec));
-        if b.capacity() < decoded.capacity() {
-            *b = SampleBuffer::new(decoded.capacity() as u64, spec);
-        }
-        b.copy_interleaved_ref(decoded);
         let ch = spec.channels.count().max(1);
+        // capacity() is frames for the decoded buffer, samples for SampleBuffer.
+        if buf.as_ref().is_none_or(|(b, s)| *s != spec || b.capacity() < decoded.capacity() * ch) {
+            buf = Some((SampleBuffer::new(decoded.capacity() as u64, spec), spec));
+        }
+        let (b, _) = buf.as_mut().expect("set above");
+        b.copy_interleaved_ref(decoded);
         samples.extend(b.samples().chunks_exact(ch).map(|f| f.iter().sum::<f32>() / ch as f32));
+        check_length(samples.len(), rate, max_seconds)?;
     }
     Ok(Pcm { rate, samples })
 }
@@ -169,7 +206,7 @@ pub fn voice_note(data: &[u8], ext_hint: Option<&str>) -> Result<VoiceNote> {
     if pcm.samples.is_empty() {
         bail!("audio has no samples");
     }
-    let ogg = if is_ogg(data) && find(data, b"OpusHead").is_some() { data.to_vec() } else { encode_ogg_opus(&pcm)? };
+    let ogg = if is_ogg_opus(data) { data.to_vec() } else { encode_ogg_opus(&pcm)? };
     Ok(VoiceNote { seconds: pcm.seconds().ceil().max(1.0) as u32, waveform: waveform(&pcm), ogg })
 }
 
@@ -223,9 +260,7 @@ pub fn waveform(pcm: &Pcm) -> Vec<u8> {
         })
         .collect();
     let peak = rms.iter().cloned().fold(0.0f32, f32::max);
-    rms.iter()
-        .map(|r| if peak > 0.0 { (r / peak * 100.0).round() as u8 } else { 0 })
-        .collect()
+    rms.iter().map(|r| if peak > 0.0 { (r / peak * 100.0).round() as u8 } else { 0 }).collect()
 }
 
 /// WAV at 16 kHz for whisper.
@@ -267,6 +302,31 @@ mod tests {
         let w = whisper_wav(&wav, Some("wav")).unwrap();
         assert_eq!(u32::from_le_bytes(w[24..28].try_into().unwrap()), 16_000);
         assert!((w.len() - 44) / 2 >= 15_900);
+    }
+
+    #[test]
+    fn long_or_huge_input_stops_decoding() {
+        let opus = encode_ogg_opus(&tone(2.5, OPUS_RATE)).unwrap();
+        let wav = to_wav(&tone(2.5, 22_050));
+        for (data, ext) in [(&opus, "ogg"), (&wav, "wav")] {
+            let e = decode_up_to(data, Some(ext), 1).err().expect(ext).to_string();
+            assert!(e.contains("longer than 1 seconds"), "{ext}: {e}");
+            assert!(decode_up_to(data, Some(ext), 3).is_ok(), "{ext}");
+        }
+        let e = decode(&vec![0u8; MAX_BYTES + 1], None).err().unwrap().to_string();
+        assert!(e.contains("limit"), "{e}");
+    }
+
+    #[test]
+    fn opus_is_detected_by_the_first_packet_only() {
+        assert!(is_ogg_opus(&encode_ogg_opus(&tone(0.1, OPUS_RATE)).unwrap()));
+        // "OpusHead" past the first packet (in a tag, say) is not an Opus stream.
+        let mut fake = Vec::new();
+        let mut w = ogg::PacketWriter::new(&mut fake);
+        w.write_packet(b"\x01vorbis".to_vec(), 1, ogg::PacketWriteEndInfo::EndPage, 0).unwrap();
+        w.write_packet(b"OpusHead".to_vec(), 1, ogg::PacketWriteEndInfo::EndStream, 0).unwrap();
+        drop(w);
+        assert!(is_ogg(&fake) && !is_ogg_opus(&fake));
     }
 
     #[test]

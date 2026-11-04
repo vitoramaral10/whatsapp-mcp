@@ -17,16 +17,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use log::info;
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use log::{error, info, warn};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.to_string())
+}
+
+/// Seconds from the environment; a value that is not a usable duration falls
+/// back to `default` with a warning.
+fn env_secs(name: &str, default: f64) -> Duration {
+    let raw = env(name, "");
+    match raw.parse::<f64>().ok().and_then(|s| Duration::try_from_secs_f64(s).ok()) {
+        Some(d) => d,
+        None => {
+            if !raw.is_empty() {
+                warn!("{name}={raw} is not a valid number of seconds; using {default}");
+            }
+            Duration::from_secs_f64(default)
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -57,16 +70,17 @@ async fn run() -> Result<()> {
         match store.import_whatsmeow(&store_dir.join("whatsapp.db")) {
             Ok(n) if n > 0 => info!("imported {n} contacts and LID mappings from the old whatsmeow store"),
             Ok(_) => {}
-            Err(e) => log::warn!("whatsmeow import skipped: {e:#}"),
+            Err(e) => warn!("whatsmeow import skipped: {e:#}"),
         }
     }
 
-    let allowed: Vec<String> = env("WHATSAPP_ALLOWED_CHATS", "")
+    // A bad entry stops the start: skipping it could leave the list empty, which means every chat.
+    let allowed = env("WHATSAPP_ALLOWED_CHATS", "")
         .split(',')
         .map(str::trim)
         .filter(|c| !c.is_empty())
-        .map(|c| if c.contains('@') { c.to_string() } else { format!("{c}@s.whatsapp.net") })
-        .collect();
+        .map(|c| wa::recipient_jid(c).map(|j| j.to_string()).with_context(|| format!("WHATSAPP_ALLOWED_CHATS entry {c:?}")))
+        .collect::<Result<Vec<_>>>()?;
     if !allowed.is_empty() {
         store.restrict(&allowed)?;
         info!("MCP tools limited to {} chats", allowed.len());
@@ -74,17 +88,12 @@ async fn run() -> Result<()> {
 
     let wa = wa::Wa::new(Arc::clone(&store), store_dir.clone());
     let pair_phone = Some(env("WHATSAPP_PAIR_PHONE", "")).filter(|p| !p.is_empty());
-    wa.start(&store_dir.join(env("WHATSAPP_SESSION_DB", "whatsapp-rs.db")), pair_phone).await?;
+    let mut bot = wa.start(&store_dir.join(env("WHATSAPP_SESSION_DB", "whatsapp-rs.db")), pair_phone).await?;
     lock_down(&store_dir);
 
     let whisper = env("WHISPER_URL", "");
     let transcriber = (!whisper.is_empty()).then(|| {
-        transcribe::Transcriber::new(
-            whisper,
-            Arc::clone(&store),
-            Duration::from_secs_f64(env("WHISPER_WAIT_S", "10").parse().unwrap_or(10.0)),
-            Duration::from_secs_f64(env("WHISPER_TIMEOUT_S", "180").parse().unwrap_or(180.0)),
-        )
+        transcribe::Transcriber::new(whisper, Arc::clone(&store), env_secs("WHISPER_WAIT_S", 10.0), env_secs("WHISPER_TIMEOUT_S", 180.0))
     });
     if let Some(t) = &transcriber {
         tokio::spawn(transcribe_incoming(Arc::clone(t), Arc::clone(&wa), Arc::clone(&store)));
@@ -113,27 +122,40 @@ async fn run() -> Result<()> {
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp::Server::new(Arc::clone(&mcp_ctx))),
         LocalSessionManager::default().into(),
-        // Clients reach this through the gateway by service name, not localhost.
+        // Clients may reach this behind a proxy under any host name, not only localhost.
         StreamableHttpServerConfig::default().disable_allowed_hosts(),
     );
     let mcp_addr: SocketAddr = format!("{}:{}", env("MCP_HOST", "0.0.0.0"), env("MCP_PORT", "8000")).parse()?;
-    let api_addr: SocketAddr = format!("0.0.0.0:{}", env("WHATSAPP_API_PORT", "8080")).parse()?;
+    let api_host = env("WHATSAPP_API_HOST", &env("MCP_HOST", "0.0.0.0"));
+    let api_addr: SocketAddr = format!("{api_host}:{}", env("WHATSAPP_API_PORT", "8080")).parse()?;
 
     let mcp_app = Router::new().nest_service("/mcp", mcp_service);
-    let api_app = Router::new()
-        .route("/api/send", post(api_send))
-        .route("/api/download", post(api_download))
-        .with_state(Arc::clone(&ctx));
+    let api_app = Router::new().route("/api/send", post(api_send)).route("/api/download", post(api_download)).with_state(Arc::clone(&ctx));
 
     info!("MCP on http://{mcp_addr}/mcp, REST API on http://{api_addr}/api");
     let mcp_listener = tokio::net::TcpListener::bind(mcp_addr).await?;
     let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
-    tokio::select! {
-        r = axum::serve(mcp_listener, mcp_app) => r?,
-        r = axum::serve(api_listener, api_app) => r?,
-        _ = shutdown() => info!("shutting down"),
-    }
-    Ok(())
+    // A logged-out session fails again on every restart, so a stopped client
+    // keeps the history tools serving instead of exiting into a restart loop.
+    let client_stopped = async {
+        (&mut bot).await;
+        error!(
+            "WhatsApp client stopped (logged out or replaced by another session); history stays readable, but to send again delete the session database and pair again"
+        );
+        std::future::pending::<()>().await
+    };
+    let served = tokio::select! {
+        r = axum::serve(mcp_listener, mcp_app) => r.context("MCP server stopped"),
+        r = axum::serve(api_listener, api_app) => r.context("REST API stopped"),
+        () = client_stopped => unreachable!(),
+        _ = stop_signal() => {
+            info!("shutting down");
+            Ok(())
+        }
+    };
+    // Flushes the device snapshot, pending receipts and message secrets.
+    bot.shutdown().await;
+    served
 }
 
 /// The store holds the session keys and the whole history: owner only. SQLite
@@ -142,7 +164,7 @@ fn lock_down(store_dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let set = |p: &std::path::Path, mode: u32| {
         if let Err(e) = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)) {
-            log::warn!("chmod {mode:o} {}: {e}", p.display());
+            warn!("chmod {mode:o} {}: {e}", p.display());
         }
     };
     set(store_dir, 0o700);
@@ -153,7 +175,7 @@ fn lock_down(store_dir: &std::path::Path) {
     }
 }
 
-async fn shutdown() {
+async fn stop_signal() {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -170,7 +192,6 @@ struct SendRequest {
     media_path: String,
 }
 
-/// The Go bridge's /api/send, kept for services that call it directly.
 /// Transcribes voice notes of the last days as they come, one at a time, so
 /// the searches find what was said without anyone opening them. Audio the CDN
 /// no longer has is tried once per run.
@@ -182,7 +203,14 @@ async fn transcribe_incoming(t: Arc<transcribe::Transcriber>, wa: Arc<wa::Wa>, s
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
-        let todo: Vec<_> = store.untranscribed(since, 50).unwrap_or_default().into_iter().filter(|m| !failed.contains(m)).collect();
+        // Enough rows that the notes already given up on cannot crowd out new ones.
+        let todo = match store.untranscribed(since, 50 + failed.len() as u32) {
+            Ok(rows) => rows.into_iter().filter(|m| !failed.contains(m)).collect(),
+            Err(e) => {
+                warn!("auto transcription: listing voice notes failed: {e:#}");
+                Vec::new()
+            }
+        };
         for (id, chat) in todo {
             let outcome = match wa.download(&id, &chat).await {
                 Ok((_, path)) => loop {
@@ -193,37 +221,58 @@ async fn transcribe_incoming(t: Arc<transcribe::Transcriber>, wa: Arc<wa::Wa>, s
                 },
                 Err(e) => transcribe::Outcome::Error(format!("{e:#}")),
             };
-            if let transcribe::Outcome::Error(e) = outcome {
-                if !wa.is_connected() {
-                    break; // not the audio's fault: try it again once back online
+            match outcome {
+                transcribe::Outcome::Unreachable(e) => {
+                    warn!("auto transcription paused, whisper unreachable: {e}");
+                    break; // not the audio's fault: try it again on the next round
                 }
-                log::warn!("auto transcription of {id} failed: {e}");
-                failed.insert((id, chat));
+                transcribe::Outcome::Error(_) if !wa.is_connected() => break, // likewise, once back online
+                transcribe::Outcome::Error(e) => {
+                    warn!("auto transcription of {id} failed: {e}");
+                    failed.insert((id, chat));
+                }
+                _ => {}
             }
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
+fn failure(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({"success": false, "message": message.into()})))
+}
+
+/// The Go bridge's /api/send, kept for services that call it directly. Bound
+/// by the same read-only mode and chat allowlist as the MCP tools.
 async fn api_send(State(ctx): State<Arc<mcp::Ctx>>, Json(req): Json<SendRequest>) -> (StatusCode, Json<Value>) {
+    if ctx.read_only {
+        return failure(StatusCode::FORBIDDEN, "Sending is disabled: the server is in read-only mode");
+    }
     if req.recipient.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Recipient is required"})));
+        return failure(StatusCode::BAD_REQUEST, "Recipient is required");
     }
     if req.message.is_empty() && req.media_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Message or media path is required"})));
+        return failure(StatusCode::BAD_REQUEST, "Message or media path is required");
+    }
+    match wa::recipient_jid(&req.recipient) {
+        Ok(jid) if !ctx.store.allowed(&jid.to_string()) => {
+            return failure(StatusCode::FORBIDDEN, format!("{} is not in the allowed chats", req.recipient));
+        }
+        Ok(_) => {}
+        Err(e) => return failure(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
     let result = async {
         let file = if req.media_path.is_empty() {
             None
         } else {
-            Some(media::outgoing(&ctx.paths, &req.media_path, "", "")?)
+            Some(media::outgoing(&ctx.paths, ctx.allowed_chat(), &req.media_path, "", "").await?)
         };
         ctx.wa.send(&req.recipient, &req.message, file, false, None).await
     }
     .await;
     match result {
         Ok(m) => (StatusCode::OK, Json(json!({"success": true, "message": m}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"success": false, "message": format!("{e:#}")}))),
+        Err(e) => failure(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }
 
@@ -235,7 +284,10 @@ struct DownloadRequest {
 
 async fn api_download(State(ctx): State<Arc<mcp::Ctx>>, Json(req): Json<DownloadRequest>) -> (StatusCode, Json<Value>) {
     if req.message_id.is_empty() || req.chat_jid.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "message": "Message ID and Chat JID are required"})));
+        return failure(StatusCode::BAD_REQUEST, "Message ID and Chat JID are required");
+    }
+    if !ctx.store.allowed(&req.chat_jid) {
+        return failure(StatusCode::FORBIDDEN, "Chat is not in the allowed chats");
     }
     match ctx.wa.download(&req.message_id, &req.chat_jid).await {
         Ok((kind, path)) => (
@@ -247,9 +299,6 @@ async fn api_download(State(ctx): State<Arc<mcp::Ctx>>, Json(req): Json<Download
                 "path": path,
             })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"success": false, "message": format!("Failed to download media: {e:#}")})),
-        ),
+        Err(e) => failure(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to download media: {e:#}")),
     }
 }

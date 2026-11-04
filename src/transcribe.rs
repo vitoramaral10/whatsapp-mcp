@@ -1,17 +1,17 @@
 //! Voice-note transcription through a whisper.cpp server.
 //!
-//! One run takes ~25 s on the homelab GPU, longer than the gateway's per-call
-//! deadline, so it runs in the background and the text is saved as the text of
-//! the message, where the searches find it. A call waits `wait` and otherwise
-//! reports the job as pending; a later call reads the saved text.
+//! One run can take longer than an MCP client's per-call timeout, so it runs in
+//! the background and the text is saved as the text of the message, where the
+//! searches find it. A call waits `wait` and otherwise reports the job as
+//! pending; a later call reads the saved text.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use tokio::sync::{watch, Semaphore};
+use anyhow::{Context, Result, anyhow};
+use tokio::sync::{Semaphore, watch};
 
 use crate::store::Store;
 
@@ -20,9 +20,13 @@ pub enum Outcome {
     Text(String),
     Pending,
     Error(String),
+    /// The whisper server could not be reached: says nothing about the audio
+    /// itself. A timeout is an Error: a note that always times out must not
+    /// hold up the queue forever.
+    Unreachable(String),
 }
 
-type Job = watch::Receiver<Option<Result<String, String>>>;
+type Job = watch::Receiver<Option<Outcome>>;
 
 pub struct Transcriber {
     url: String,
@@ -59,10 +63,7 @@ impl Transcriber {
         };
         let done = tokio::time::timeout(self.wait, rx.wait_for(|r| r.is_some())).await;
         match done {
-            Ok(Ok(result)) => match result.clone().expect("checked by wait_for") {
-                Ok(text) => Outcome::Text(text),
-                Err(e) => Outcome::Error(e),
-            },
+            Ok(Ok(outcome)) => outcome.clone().expect("checked by wait_for"),
             Ok(Err(_)) => Outcome::Error("transcription task ended without a result".into()),
             Err(_) => Outcome::Pending,
         }
@@ -76,10 +77,14 @@ impl Transcriber {
                 this.store.set_transcription(&id, &chat_jid, &text)?;
                 Ok(text)
             });
-            let result = result.map_err(|e| format!("{e:#}"));
+            let outcome = match result {
+                Ok(text) => Outcome::Text(text),
+                Err(e) if unreachable(&e) => Outcome::Unreachable(format!("{e:#}")),
+                Err(e) => Outcome::Error(format!("{e:#}")),
+            };
             // Errors are not cached, so the next call retries.
             this.jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&file);
-            let _ = tx.send(Some(result));
+            let _ = tx.send(Some(outcome));
         });
         rx
     }
@@ -108,6 +113,11 @@ impl Transcriber {
     }
 }
 
+/// A connect failure talking to whisper.
+fn unreachable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect)
+}
+
 fn legacy_cache(file: &Path) -> PathBuf {
     let mut p = file.as_os_str().to_owned();
     p.push(".txt");
@@ -123,7 +133,9 @@ mod tests {
     fn setup(dir: &Path, wait: Duration) -> (Arc<Store>, Arc<Transcriber>, PathBuf) {
         let store = Arc::new(Store::open(&dir.join("messages.db")).unwrap());
         store.store_chat("55@s.whatsapp.net", "Ana", Utc::now()).unwrap();
-        store.store_message("V", "55@s.whatsapp.net", "55", "", Utc::now(), false, &Media { kind: "audio".into(), ..Default::default() }).unwrap();
+        store
+            .store_message("V", "55@s.whatsapp.net", "55", "", Utc::now(), false, &Media { kind: "audio".into(), ..Default::default() })
+            .unwrap();
         let t = Transcriber::new("http://127.0.0.1:9".into(), Arc::clone(&store), wait, Duration::from_secs(1));
         (store, t, dir.join("a.ogg"))
     }
@@ -149,5 +161,28 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(t.jobs.lock().unwrap().is_empty());
         assert_eq!(store.transcription("V", "55@s.whatsapp.net"), None);
+    }
+
+    #[tokio::test]
+    async fn a_whisper_server_that_is_down_is_unreachable_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, t, _) = setup(dir.path(), Duration::from_secs(5));
+        let f = dir.path().join("a.wav");
+        std::fs::write(&f, crate::audio::to_wav(&crate::audio::Pcm { rate: 16_000, samples: vec![0.0; 1600] })).unwrap();
+        // Nothing listens on the discard port.
+        assert!(matches!(t.transcription("V", "55@s.whatsapp.net", &f).await, Outcome::Unreachable(_)));
+    }
+
+    #[tokio::test]
+    async fn a_whisper_server_that_never_answers_fails_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("messages.db")).unwrap());
+        // Accepts the connection (the kernel does) but never replies.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let t = Transcriber::new(url, store, Duration::from_secs(5), Duration::from_millis(300));
+        let f = dir.path().join("a.wav");
+        std::fs::write(&f, crate::audio::to_wav(&crate::audio::Pcm { rate: 16_000, samples: vec![0.0; 1600] })).unwrap();
+        assert!(matches!(t.transcription("V", "55@s.whatsapp.net", &f).await, Outcome::Error(_)));
     }
 }
