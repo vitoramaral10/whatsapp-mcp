@@ -27,6 +27,7 @@ fn is_placeholder(name: &str) -> bool {
 
 pub const EDITED: &str = "[edited] ";
 pub const DELETED: &str = "[deleted] ";
+pub const TRANSCRIBED: &str = "[transcription] ";
 
 pub fn format_ts(ts: DateTime<Utc>) -> String {
     ts.format(TS_FORMAT).to_string()
@@ -354,13 +355,16 @@ impl Store {
         }
         self.conn().execute(
             // An upsert, not REPLACE: the row keeps its rowid, which the
-            // full-text index and the vectors are keyed by.
+            // full-text index and the vectors are keyed by. A transcript is
+            // never lost to the same audio arriving again.
             "INSERT INTO messages
              (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url,
               media_key, file_sha256, file_enc_sha256, file_length, direct_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id, chat_jid) DO UPDATE SET
-               sender = excluded.sender, content = excluded.content, timestamp = excluded.timestamp,
+               sender = excluded.sender,
+               content = CASE WHEN instr(messages.content, '[transcription] ') > 0 THEN messages.content ELSE excluded.content END,
+               timestamp = excluded.timestamp,
                is_from_me = excluded.is_from_me, media_type = excluded.media_type, filename = excluded.filename,
                url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
                file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length,
@@ -560,6 +564,22 @@ impl Store {
             params![id, chat_jid, DELETED],
         )?;
         Ok(n > 0)
+    }
+
+    /// The voice note's transcript goes in the text of the message, so the
+    /// searches find it; a caption, if any, stays in front.
+    pub fn set_transcription(&self, id: &str, chat_jid: &str, text: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE messages SET content = ltrim(COALESCE(content, '') || char(10) || ?3, char(10))
+             WHERE id = ?1 AND chat_jid = ?2 AND instr(COALESCE(content, ''), ?4) = 0",
+            params![id, chat_jid, format!("{TRANSCRIBED}{text}"), TRANSCRIBED],
+        )?;
+        Ok(())
+    }
+
+    pub fn transcription(&self, id: &str, chat_jid: &str) -> Option<String> {
+        let content = self.message_content(id, chat_jid)?;
+        content.find(TRANSCRIBED).map(|i| content[i + TRANSCRIBED.len()..].to_string())
     }
 
     /// (is_from_me, sender, content) of a message, to quote it in a reply.
@@ -1001,6 +1021,26 @@ mod tests {
         assert!(!s.revoke_message("A", "55@s.whatsapp.net").unwrap());
         assert_eq!(s.message_content("A", "55@s.whatsapp.net").as_deref(), Some("[deleted] [edited] olá"));
         assert!(!s.edit_message("missing", "55@s.whatsapp.net", "x").unwrap());
+    }
+
+    #[test]
+    fn transcripts_are_searchable_text_that_a_redelivery_keeps() {
+        let (_d, s) = temp_store();
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let audio = Media { kind: "audio".into(), ..Default::default() };
+        s.store_chat("55@s.whatsapp.net", "Ana", t).unwrap();
+        s.store_message("V", "55@s.whatsapp.net", "55", "", t, false, &audio).unwrap();
+        assert_eq!(s.transcription("V", "55@s.whatsapp.net"), None);
+        s.set_transcription("V", "55@s.whatsapp.net", "chego às dez").unwrap();
+        s.set_transcription("V", "55@s.whatsapp.net", "again").unwrap();
+        s.store_message("V", "55@s.whatsapp.net", "55", "", t, false, &audio).unwrap();
+        assert_eq!(s.message_content("V", "55@s.whatsapp.net").as_deref(), Some("[transcription] chego às dez"));
+        assert_eq!(s.transcription("V", "55@s.whatsapp.net").as_deref(), Some("chego às dez"));
+        let found = s.list_messages(&MessageFilter { query: Some("dez".into()), limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(found.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["V"]);
+        s.store_message("C", "55@s.whatsapp.net", "55", "ouve", t, false, &audio).unwrap();
+        s.set_transcription("C", "55@s.whatsapp.net", "oi").unwrap();
+        assert_eq!(s.message_content("C", "55@s.whatsapp.net").as_deref(), Some("ouve\n[transcription] oi"));
     }
 
     fn chat_with(s: &Store, jid: &str, msgs: &[(&str, &str)]) {

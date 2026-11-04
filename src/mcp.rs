@@ -444,7 +444,7 @@ impl Server {
         });
         if mime.starts_with("audio/") {
             if let Some(t) = &self.ctx.transcriber {
-                match t.transcription(&path).await {
+                match t.transcription(&a.message_id, &a.chat_jid, &path).await {
                     Outcome::Text(text) => info["transcription"] = text.into(),
                     Outcome::Pending => {
                         info["transcription_pending"] = "Still transcribing; call download_media again in about 30 seconds".into()

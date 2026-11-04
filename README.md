@@ -50,7 +50,7 @@ printed 8-character code under *Link with phone number* instead.
 | `WHATSAPP_READ_ONLY` | — | `true` hides the send, edit and delete tools from MCP clients (the REST API still sends) |
 | `WHATSAPP_ALLOWED_CHATS` | — | `,`-separated JIDs or phone numbers: the MCP tools read, download and send only in these chats; the history still records every chat, and the REST API, meant for services on a private network, is not limited |
 | `EMBED_URL` / `EMBED_MODEL` | — / `bge-m3` | OpenAI-compatible `/v1/embeddings` server (e.g. `llama-server --embedding`); enables the semantic half of `search_messages` |
-| `WHISPER_URL` | — | whisper.cpp server; voice notes get a transcript |
+| `WHISPER_URL` | — | whisper.cpp server; voice notes get a transcript, saved as the text of the message (`[transcription] ` prefix) so `list_messages` and `search_messages` find it |
 | `WHISPER_WAIT_S` / `WHISPER_TIMEOUT_S` | `10` / `180` | How long a call waits for the transcript / per-run limit |
 | `WHATSAPP_LOG_LEVEL` | `info` | Log level of the WhatsApp library |
 
@@ -87,7 +87,7 @@ cargo test
 
 Tests cover the history store against the Go bridge's format, full-text and hybrid search, the
 chat allowlist, message text extraction (menus, polls, wrappers, edits, reactions), mentions,
-read-only mode, audio decode/encode, media paths and the transcription cache.
+read-only mode, audio decode/encode, media paths and transcripts.
 
 ## License
 

@@ -81,6 +81,7 @@ async fn run() -> Result<()> {
     let transcriber = (!whisper.is_empty()).then(|| {
         transcribe::Transcriber::new(
             whisper,
+            Arc::clone(&store),
             Duration::from_secs_f64(env("WHISPER_WAIT_S", "10").parse().unwrap_or(10.0)),
             Duration::from_secs_f64(env("WHISPER_TIMEOUT_S", "180").parse().unwrap_or(180.0)),
         )
