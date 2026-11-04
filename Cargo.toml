@@ -1,0 +1,40 @@
+[package]
+name = "whatsapp-mcp"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+mime_guess = "2"
+ogg = "0.9"
+opus = "0.3"
+qrcode = { version = "0.14", default-features = false }
+# reqwest only talks plain HTTP to whisper on the internal network: no TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["multipart", "json"] }
+rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
+# 0.39 shares libsqlite3-sys with whatsapp-rust's diesel store.
+rusqlite = { version = "0.39", features = ["bundled"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "wav", "pcm", "flac", "vorbis", "ogg"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "signal", "net"] }
+env_logger = { version = "0.11", default-features = false }
+log = "0.4"
+# simd (a default feature) needs nightly.
+whatsapp-rust = { version = "0.7.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+# Size over speed: the work is I/O, ring crypto (asm) and libopus (C).
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,39 +1,28 @@
-# Stage 1: build the Go bridge (whatsmeow). CGO is required by mattn/go-sqlite3.
-FROM golang:1.26-bookworm AS bridge-build
-
+# syntax=docker/dockerfile:1
+# Static musl binary on an empty base: no shell, no libc, no package manager.
+# libopus and SQLite are compiled in from source; TLS is rustls.
+FROM rust:1.99.1-alpine3.24 AS build
+RUN apk add --no-cache musl-dev cmake make g++ perl
 WORKDIR /src
-COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
-RUN go mod download
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY src src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked \
+ && cp target/release/whatsapp-mcp /whatsapp-mcp \
+ && mkdir -m 1777 /scratch-tmp
 
-COPY whatsapp-bridge/ ./
-RUN CGO_ENABLED=1 GOOS=linux go build -o /out/whatsapp-bridge .
-
-# Stage 2: runtime with Python for the MCP server and ffmpeg for voice messages.
-FROM python:3.11-slim-bookworm
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
- && rm -rf /var/lib/apt/lists/*
-
-# Upper bound matters: the server code is MCP SDK v1 (FastMCP), which 2.x renamed to
-# MCPServer. Lower bound is where streamable-http landed, past the 1.6.0 the repo pins; 1.10 adds structured_output=False.
-RUN pip install --no-cache-dir "mcp[cli]>=1.10.0,<2" "httpx>=0.28.1" "requests>=2.32.3"
-
-WORKDIR /app
-COPY --from=bridge-build /out/whatsapp-bridge /app/whatsapp-bridge/whatsapp-bridge
-COPY whatsapp-mcp-server/ /app/whatsapp-mcp-server/
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# The bridge writes its SQLite stores relative to its working dir; whatsapp.py reads
-# ../whatsapp-bridge/store/messages.db, so this layout must be preserved.
-RUN mkdir -p /app/whatsapp-bridge/store && chown -R 1000:1000 /app
-
-ENV MCP_TRANSPORT=streamable-http \
-    MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000 \
-    WHATSAPP_API_BASE_URL=http://127.0.0.1:8080/api \
-    PYTHONUNBUFFERED=1
-
-EXPOSE 8000
-ENTRYPOINT ["/app/entrypoint.sh"]
+FROM scratch
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /whatsapp-mcp /whatsapp-mcp
+# SQLite needs a temp dir for large sorts; scratch has none.
+COPY --from=build /scratch-tmp /tmp
+# The store is a bind mount owned by 1000:1000; media paths keep the old layout.
+ENV WHATSAPP_STORE_DIR=/app/whatsapp-bridge/store \
+    TMPDIR=/tmp \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+USER 1000:1000
+EXPOSE 8000 8080
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s CMD ["/whatsapp-mcp", "healthcheck"]
+ENTRYPOINT ["/whatsapp-mcp"]
