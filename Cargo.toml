@@ -2,6 +2,13 @@
 name = "whatsapp-mcp"
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.99"
+description = "MCP server for a personal WhatsApp account: search, read and send messages, media and voice notes"
+license = "MIT"
+repository = "https://github.com/vitoramaral10/whatsapp-mcp"
+readme = "README.md"
+keywords = ["mcp", "mcp-server", "whatsapp", "llm", "ai"]
+categories = ["command-line-utilities"]
 publish = false
 
 [dependencies]
@@ -13,7 +20,7 @@ mime_guess = "2"
 ogg = "0.9"
 opus = "0.3"
 qrcode = { version = "0.14", default-features = false }
-# reqwest only talks plain HTTP to whisper on the internal network: no TLS stack.
+# reqwest only talks plain HTTP to the whisper and embedding servers: no TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "json"] }
 rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
 # 0.39 shares libsqlite3-sys with whatsapp-rust's diesel store.
@@ -36,5 +43,6 @@ tempfile = "3"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# A decoder panic on attacker-supplied media must stay inside its spawn_blocking task, not kill the server.
+panic = "unwind"
 strip = true

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Static musl binary on an empty base: no shell, no libc, no package manager.
 # libopus and SQLite are compiled in from source; TLS is rustls.
-FROM rust:1.99.1-alpine3.24 AS build
+FROM rust:1.99.1-alpine3.24@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS build
 RUN apk add --no-cache musl-dev cmake make g++ perl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -14,6 +14,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && mkdir -m 1777 /scratch-tmp
 
 FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/vitoramaral10/whatsapp-mcp" \
+      org.opencontainers.image.description="WhatsApp MCP server in a single static binary" \
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /whatsapp-mcp /whatsapp-mcp
 # SQLite needs a temp dir for large sorts; scratch has none.

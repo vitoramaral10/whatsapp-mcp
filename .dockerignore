@@ -1,1 +1,6 @@
-target
+# Only what the build stage copies; keeps the store, .git and local files out of the context.
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo/
+!src/
