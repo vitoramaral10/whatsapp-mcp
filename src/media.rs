@@ -44,6 +44,25 @@ pub fn mime_of(path: &Path) -> String {
     mime_guess::from_path(path).first_raw().unwrap_or("application/octet-stream").to_string()
 }
 
+/// Width, height and whether it is animated, read from a WebP header; None if not WebP.
+pub fn webp_info(d: &[u8]) -> Option<(u32, u32, bool)> {
+    if d.len() < 30 || &d[0..4] != b"RIFF" || &d[8..12] != b"WEBP" {
+        return None;
+    }
+    let u24 = |i: usize| u32::from(d[i]) | u32::from(d[i + 1]) << 8 | u32::from(d[i + 2]) << 16;
+    match &d[12..16] {
+        b"VP8X" => Some((u24(24) + 1, u24(27) + 1, d[20] & 0x02 != 0)),
+        b"VP8 " => {
+            Some((u32::from(u16::from_le_bytes([d[26], d[27]]) & 0x3fff), u32::from(u16::from_le_bytes([d[28], d[29]]) & 0x3fff), false))
+        }
+        b"VP8L" => {
+            let b = u32::from_le_bytes([d[21], d[22], d[23], d[24]]);
+            Some(((b & 0x3fff) + 1, (b >> 14 & 0x3fff) + 1, false))
+        }
+        _ => None,
+    }
+}
+
 /// Keeps a message ID usable as one path segment.
 pub fn sanitize(value: &str) -> String {
     value.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
@@ -214,6 +233,26 @@ mod tests {
         ] {
             assert_eq!(mime_of(Path::new(ext)), mime, "{ext}");
         }
+    }
+
+    #[test]
+    fn webp_headers_give_size_and_animation() {
+        let riff = |chunk: &[u8], body: &[u8]| {
+            let mut d = b"RIFF\0\0\0\0WEBP".to_vec();
+            d.extend_from_slice(chunk);
+            d.extend_from_slice(&[0; 4]);
+            d.extend_from_slice(body);
+            d.resize(30, 0);
+            d
+        };
+        // VP8X: flags with the animation bit, canvas 512x512 stored minus one.
+        assert_eq!(webp_info(&riff(b"VP8X", &[0x02, 0, 0, 0, 0xff, 1, 0, 0xff, 1, 0])), Some((512, 512, true)));
+        // VP8 lossy: frame tag, start code, then 14-bit width and height.
+        assert_eq!(webp_info(&riff(b"VP8 ", &[0, 0, 0, 0x9d, 0x01, 0x2a, 0, 2, 0, 2])), Some((512, 512, false)));
+        // VP8L: signature, then (w-1) and (h-1) packed in 14 bits each.
+        let b = (511u32 | 511 << 14).to_le_bytes();
+        assert_eq!(webp_info(&riff(b"VP8L", &[0x2f, b[0], b[1], b[2], b[3]])), Some((512, 512, false)));
+        assert_eq!(webp_info(b"\x89PNG\r\n\x1a\n not a webp at all, padding"), None);
     }
 
     #[test]

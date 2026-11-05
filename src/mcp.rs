@@ -328,7 +328,7 @@ pub struct SendFileArgs {
     /// as the document name (e.g. "report.pdf")
     #[serde(default)]
     filename: String,
-    /// Optional text shown under a picture, video or document (not on voice notes)
+    /// Optional text shown under a picture, video or document (not on voice notes or stickers)
     #[serde(default)]
     caption: String,
     /// Optional ID of a message in this chat to reply to
@@ -588,7 +588,7 @@ impl Server {
     }
 
     #[tool(
-        description = "Send a file via WhatsApp to the specified recipient: jpg, png, gif and webp go as pictures, mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send a file via WhatsApp to the specified recipient: jpg, png and gif go as pictures, webp as a sticker (no caption), mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message.\n\nReturns a dictionary containing success status and a status message"
     )]
     async fn send_file(&self, Parameters(a): Parameters<SendFileArgs>) -> R {
         status(self.send_outgoing(a, false).await)
