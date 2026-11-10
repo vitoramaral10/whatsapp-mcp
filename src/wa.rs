@@ -593,6 +593,18 @@ impl Wa {
                 ..Default::default()
             });
         }
+        // WhatsApp only uses WebP for stickers; sent as an image it arrives as a plain photo.
+        if let Some((width, height, animated)) = media::webp_info(&f.data) {
+            let up = client.upload(f.data, MediaType::Image, UploadOptions::default()).await?;
+            return Ok(wa::Message {
+                sticker_message: uploaded!(StickerMessage, up, "image/webp".into(), {
+                    width: Some(width),
+                    height: Some(height),
+                    is_animated: Some(animated),
+                }),
+                ..Default::default()
+            });
+        }
         let mime = media::mime_of(Path::new(&f.name));
         let kind = match ext.as_str() {
             "jpg" | "jpeg" | "png" | "gif" | "webp" => MediaType::Image,

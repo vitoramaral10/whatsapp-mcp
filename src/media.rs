@@ -44,6 +44,25 @@ pub fn mime_of(path: &Path) -> String {
     mime_guess::from_path(path).first_raw().unwrap_or("application/octet-stream").to_string()
 }
 
+/// Width, height and whether it is animated, read from a WebP header; None if not WebP.
+pub fn webp_info(d: &[u8]) -> Option<(u32, u32, bool)> {
+    if d.len() < 30 || &d[0..4] != b"RIFF" || &d[8..12] != b"WEBP" {
+        return None;
+    }
+    let u24 = |i: usize| u32::from(d[i]) | u32::from(d[i + 1]) << 8 | u32::from(d[i + 2]) << 16;
+    match &d[12..16] {
+        b"VP8X" => Some((u24(24) + 1, u24(27) + 1, d[20] & 0x02 != 0)),
+        b"VP8 " => {
+            Some((u32::from(u16::from_le_bytes([d[26], d[27]]) & 0x3fff), u32::from(u16::from_le_bytes([d[28], d[29]]) & 0x3fff), false))
+        }
+        b"VP8L" => {
+            let b = u32::from_le_bytes([d[21], d[22], d[23], d[24]]);
+            Some(((b & 0x3fff) + 1, (b >> 14 & 0x3fff) + 1, false))
+        }
+        _ => None,
+    }
+}
+
 /// Keeps a message ID usable as one path segment.
 pub fn sanitize(value: &str) -> String {
     value.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
@@ -114,16 +133,23 @@ fn read_outgoing(
         let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         return Ok(Outgoing { data, name });
     }
-    let name = Path::new(filename).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if !name.trim_matches('.').contains('.') {
-        bail!("filename with an extension is required with content_base64");
-    }
+    let name = client_name(filename)?;
     // Clients often send a data: URL, or base64 wrapped at 76 columns.
     let b64 = content_base64.trim();
     let b64 = b64.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map_or(b64, |(_, rest)| rest);
     let b64: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let data = base64::engine::general_purpose::STANDARD.decode(b64)?;
     Ok(Outgoing { data, name })
+}
+
+/// The name of a file the client supplies the bytes of: basename only, and an
+/// extension, which picks the media type.
+pub fn client_name(filename: &str) -> Result<String> {
+    let name = Path::new(filename).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !name.trim_matches('.').contains('.') {
+        bail!("filename with an extension is required with content_base64 or return_upload_url");
+    }
+    Ok(name)
 }
 
 /// Where an open file really is, symlinks resolved.
@@ -214,6 +240,26 @@ mod tests {
         ] {
             assert_eq!(mime_of(Path::new(ext)), mime, "{ext}");
         }
+    }
+
+    #[test]
+    fn webp_headers_give_size_and_animation() {
+        let riff = |chunk: &[u8], body: &[u8]| {
+            let mut d = b"RIFF\0\0\0\0WEBP".to_vec();
+            d.extend_from_slice(chunk);
+            d.extend_from_slice(&[0; 4]);
+            d.extend_from_slice(body);
+            d.resize(30, 0);
+            d
+        };
+        // VP8X: flags with the animation bit, canvas 512x512 stored minus one.
+        assert_eq!(webp_info(&riff(b"VP8X", &[0x02, 0, 0, 0, 0xff, 1, 0, 0xff, 1, 0])), Some((512, 512, true)));
+        // VP8 lossy: frame tag, start code, then 14-bit width and height.
+        assert_eq!(webp_info(&riff(b"VP8 ", &[0, 0, 0, 0x9d, 0x01, 0x2a, 0, 2, 0, 2])), Some((512, 512, false)));
+        // VP8L: signature, then (w-1) and (h-1) packed in 14 bits each.
+        let b = (511u32 | 511 << 14).to_le_bytes();
+        assert_eq!(webp_info(&riff(b"VP8L", &[0x2f, b[0], b[1], b[2], b[3]])), Some((512, 512, false)));
+        assert_eq!(webp_info(b"\x89PNG\r\n\x1a\n not a webp at all, padding"), None);
     }
 
     #[test]

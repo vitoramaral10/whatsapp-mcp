@@ -6,6 +6,10 @@ and versions follow [Semantic Versioning](https://semver.org).
 ## [Unreleased]
 
 ### Added
+- `return_upload_url` in `send_file` and `send_audio_message`: a one-shot URL the client PUTs
+  a file from its own disk to (`curl -T`), sent when the upload completes. Served on its own
+  listener (`WHATSAPP_UPLOAD_URL`, `WHATSAPP_UPLOAD_PORT`). The tool descriptions now steer away
+  from typing files out as `content_base64`.
 - Unread counts in `list_chats` (`unread_only`), `mark_chat_read`, `send_reaction` and `get_digest`.
 - `edit_message` and `delete_message` for messages you sent.
 - Voice notes are transcribed as they arrive, and transcripts are stored as the message text.
