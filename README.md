@@ -72,6 +72,8 @@ Clients that only speak stdio can go through [`mcp-remote`](https://www.npmjs.co
 | `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | MCP listener |
 | `WHATSAPP_API_HOST` / `WHATSAPP_API_PORT` | `MCP_HOST` / `8080` | REST API listener |
 | `WHATSAPP_SEND_DIRS` | store dir | `:`-separated directories `send_file` and `/api/send` may read from; databases and files in the store root are always refused |
+| `WHATSAPP_UPLOAD_URL` | — | Public base URL of the upload listener (e.g. `http://homelab:8090`); turns on `return_upload_url` in `send_file` and `send_audio_message` |
+| `WHATSAPP_UPLOAD_HOST` / `WHATSAPP_UPLOAD_PORT` | `MCP_HOST` / `8090` | Upload listener; it serves only `PUT /upload/<token>` and starts only with `WHATSAPP_UPLOAD_URL` set |
 | `WHATSAPP_MEDIA_HOST_PATH` | — | Host side of the store bind mount, so returned paths open on the host |
 | `WHATSAPP_MEDIA_MAX_INLINE_BYTES` | `8388608` | Larger media come back as a path only |
 | `WHATSAPP_READ_ONLY` | — | `true` hides every tool that writes (send, edit, delete, react, mark read) and makes `/api/send` refuse |
@@ -95,7 +97,8 @@ deployments keep working.
 - **get_last_interaction**, **get_message_context**
 - **send_message**: text to a phone number or JID; `reply_to_message_id` quotes a message, and
   every `@<phone number>` in the text becomes a mention
-- **send_file**: image, video or document, from a path in the send dirs or `content_base64` + `filename`
+- **send_file**: image, video or document, from a path in the send dirs, from the client's disk
+  with `return_upload_url` + `filename`, or a small `content_base64` + `filename`
 - **send_audio_message**: MP3, AAC/M4A, WAV, FLAC, Ogg Vorbis or Ogg Opus, sent as an Opus voice note
 - **get_digest**: a period chat by chat, busiest first, with message and unread counts and the
   latest messages in order, for "what happened today" summaries
@@ -105,6 +108,13 @@ deployments keep working.
   or delete for everyone a message you sent
 - **download_media**: the file itself (image block or embedded resource) plus metadata; voice
   notes also carry `transcription`, or `transcription_pending` while whisper is still running
+
+A client on another machine has no path in the send dirs, and a model cannot type a PDF out as
+base64. With `return_upload_url: true` (and `WHATSAPP_UPLOAD_URL` set) the send tools send
+nothing yet and return a one-shot `upload_url`; the client runs `curl -sS -T <file> '<upload_url>'`
+and the message goes out when the upload completes, with the send result as the response. The
+URL is a 128-bit random token, works once and expires in 15 minutes; publish the upload port
+only where the clients are (a VPN, the LAN), since the token is its only credential.
 
 Every listed message carries its `Message ID` and `Chat JID`, and the send tools return the new
 message's ID: those are what replies, edits, deletions and reactions take. Unread counts start

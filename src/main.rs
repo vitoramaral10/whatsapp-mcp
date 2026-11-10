@@ -9,6 +9,7 @@ mod mcp;
 mod media;
 mod store;
 mod transcribe;
+mod upload;
 mod wa;
 
 use std::net::SocketAddr;
@@ -104,6 +105,9 @@ async fn run() -> Result<()> {
         tokio::spawn(Arc::clone(e).backfill(Arc::clone(&store)));
     }
     let read_only = matches!(env("WHATSAPP_READ_ONLY", "").to_lowercase().as_str(), "1" | "true" | "yes");
+    // Read-only has no send tools to hand out upload URLs, so no listener either.
+    let upload_url = env("WHATSAPP_UPLOAD_URL", "");
+    let uploads = (!upload_url.is_empty() && !read_only).then(|| Arc::new(upload::Uploads::new(upload_url)));
     let ctx = Arc::new(mcp::Ctx {
         store,
         wa: Arc::clone(&wa),
@@ -116,6 +120,7 @@ async fn run() -> Result<()> {
         max_inline: env("WHATSAPP_MEDIA_MAX_INLINE_BYTES", "8388608").parse().unwrap_or(8 << 20),
         embedder,
         read_only,
+        uploads,
     });
 
     let mcp_ctx = Arc::clone(&ctx);
@@ -135,6 +140,17 @@ async fn run() -> Result<()> {
     info!("MCP on http://{mcp_addr}/mcp, REST API on http://{api_addr}/api");
     let mcp_listener = tokio::net::TcpListener::bind(mcp_addr).await?;
     let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
+    // Its own port, so publishing it exposes the upload URLs and nothing of /api.
+    let upload_server = async {
+        if ctx.uploads.is_none() {
+            return std::future::pending::<Result<()>>().await;
+        }
+        let addr: SocketAddr =
+            format!("{}:{}", env("WHATSAPP_UPLOAD_HOST", &env("MCP_HOST", "0.0.0.0")), env("WHATSAPP_UPLOAD_PORT", "8090")).parse()?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!("upload URLs on http://{addr}/upload, handed out as {}/upload", env("WHATSAPP_UPLOAD_URL", "").trim_end_matches('/'));
+        axum::serve(listener, upload::router(Arc::clone(&ctx))).await.context("upload server stopped")
+    };
     // A logged-out session fails again on every restart, so a stopped client
     // keeps the history tools serving instead of exiting into a restart loop.
     let client_stopped = async {
@@ -147,6 +163,7 @@ async fn run() -> Result<()> {
     let served = tokio::select! {
         r = axum::serve(mcp_listener, mcp_app) => r.context("MCP server stopped"),
         r = axum::serve(api_listener, api_app) => r.context("REST API stopped"),
+        r = upload_server => r,
         () = client_stopped => unreachable!(),
         _ = stop_signal() => {
             info!("shutting down");

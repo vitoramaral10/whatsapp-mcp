@@ -15,6 +15,7 @@ use crate::embed::Embedder;
 use crate::media::{self, PathMap};
 use crate::store::{MessageFilter, Store, format_message, format_messages, parse_ts};
 use crate::transcribe::{Outcome, Transcriber};
+use crate::upload::{Slot, Uploads};
 use crate::wa::Wa;
 
 pub struct Ctx {
@@ -28,6 +29,8 @@ pub struct Ctx {
     pub embedder: Option<Arc<Embedder>>,
     /// Hides the send tools: whatever a message says, the model cannot answer it.
     pub read_only: bool,
+    /// One-shot upload URLs for send_*; None when no public upload URL is set.
+    pub uploads: Option<Arc<Uploads>>,
 }
 
 impl Ctx {
@@ -316,18 +319,24 @@ pub struct SendFileArgs {
     /// or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
     recipient: String,
     /// Path to a file already on the WhatsApp server (e.g. one returned by download_media),
-    /// up to 100 MB. Leave empty when sending content_base64.
+    /// up to 100 MB. Not a path on the client's machine: for those use return_upload_url.
     #[serde(default)]
     media_path: String,
-    /// The file content, base64-encoded (a data: URL prefix is accepted). Use this to send
-    /// a file from the client side. The whole request is capped at 4 MiB, so the file must
-    /// be under about 3 MB; send larger files with media_path.
+    /// The file content, base64-encoded (a data: URL prefix is accepted). Only for a few KB
+    /// already in base64 in hand: never type a file's bytes out as base64, and never use it
+    /// for a file on disk, which goes with return_upload_url.
     #[serde(default)]
     content_base64: String,
-    /// Required with content_base64; its extension picks the media type and it is shown
-    /// as the document name (e.g. "report.pdf")
+    /// Required with content_base64 or return_upload_url; its extension picks the media type
+    /// and it is shown as the document name (e.g. "report.pdf")
     #[serde(default)]
     filename: String,
+    /// The way to send a file from the client's own disk, of any size up to 100 MB: nothing
+    /// is sent yet, and the result has a one-shot upload_url. PUT the file there
+    /// (curl -sS -T /path/to/file '<upload_url>'); the message goes out when the upload
+    /// completes, and curl prints its result. The URL expires in 15 minutes.
+    #[serde(default)]
+    return_upload_url: bool,
     /// Optional text shown under a picture, video or document (not on voice notes or stickers)
     #[serde(default)]
     caption: String,
@@ -342,17 +351,23 @@ pub struct SendAudioArgs {
     /// or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
     recipient: String,
     /// Path to an audio file already on the WhatsApp server (e.g. one returned by
-    /// download_media), up to 100 MB. Leave empty when sending content_base64.
+    /// download_media), up to 100 MB. Not a path on the client's machine: for those use
+    /// return_upload_url.
     #[serde(default)]
     media_path: String,
-    /// The audio, base64-encoded (a data: URL prefix is accepted). The whole request is
-    /// capped at 4 MiB, so the file must be under about 3 MB; send larger files with media_path.
+    /// The audio, base64-encoded (a data: URL prefix is accepted). Only for a few KB already
+    /// in base64 in hand: a file on disk goes with return_upload_url.
     #[serde(default)]
     content_base64: String,
-    /// Required with content_base64; its extension tells the decoder the format
-    /// (e.g. "note.mp3")
+    /// Required with content_base64 or return_upload_url; its extension tells the decoder
+    /// the format (e.g. "note.mp3")
     #[serde(default)]
     filename: String,
+    /// The way to send audio from the client's own disk: the result has a one-shot
+    /// upload_url to PUT the file to (curl -sS -T /path/to/file '<upload_url>'), and the
+    /// voice note goes out when the upload completes. The URL expires in 15 minutes.
+    #[serde(default)]
+    return_upload_url: bool,
     /// Optional ID of a message in this chat to reply to
     #[serde(default)]
     reply_to_message_id: Option<String>,
@@ -588,14 +603,17 @@ impl Server {
     }
 
     #[tool(
-        description = "Send a file via WhatsApp to the specified recipient: jpg, png and gif go as pictures, webp as a sticker (no caption), mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send a file via WhatsApp to the specified recipient: jpg, png and gif go as pictures, webp as a sticker (no caption), mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message. A file on the client's own machine goes with return_upload_url, never as base64 typed into the call.\n\nReturns a dictionary containing success status and a status message"
     )]
     async fn send_file(&self, Parameters(a): Parameters<SendFileArgs>) -> R {
+        if a.return_upload_url {
+            return self.upload_url(a, false);
+        }
         status(self.send_outgoing(a, false).await)
     }
 
     #[tool(
-        description = "Send an audio file as a WhatsApp voice note to the specified recipient. For group messages use the JID. MP3, AAC/M4A, WAV, FLAC, Ogg Vorbis and Ogg Opus are accepted, up to 30 minutes and 100 MB; anything but Ogg Opus is converted to Opus.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send an audio file as a WhatsApp voice note to the specified recipient. For group messages use the JID. MP3, AAC/M4A, WAV, FLAC, Ogg Vorbis and Ogg Opus are accepted, up to 30 minutes and 100 MB; anything but Ogg Opus is converted to Opus. A file on the client's own machine goes with return_upload_url.\n\nReturns a dictionary containing success status and a status message"
     )]
     async fn send_audio_message(&self, Parameters(a): Parameters<SendAudioArgs>) -> R {
         let a = SendFileArgs {
@@ -605,7 +623,11 @@ impl Server {
             filename: a.filename,
             caption: String::new(),
             reply_to_message_id: a.reply_to_message_id,
+            return_upload_url: a.return_upload_url,
         };
+        if a.return_upload_url {
+            return self.upload_url(a, true);
+        }
         status(self.send_outgoing(a, true).await)
     }
 
@@ -673,6 +695,30 @@ impl Server {
         Ok(())
     }
 
+    /// Registers the send and returns where to PUT the file; the upload sends it.
+    fn upload_url(&self, a: SendFileArgs, voice: bool) -> R {
+        self.allowed_recipient(&a.recipient)?;
+        let Some(uploads) = &self.ctx.uploads else {
+            return fail(
+                "Upload URLs are off on this server (WHATSAPP_UPLOAD_URL is not set); put the file in a send dir and use media_path",
+            );
+        };
+        if !a.media_path.is_empty() || !a.content_base64.is_empty() {
+            return fail("return_upload_url takes the file by upload: leave media_path and content_base64 empty");
+        }
+        let name = media::client_name(&a.filename).map_err(invalid)?;
+        let slot = Slot { recipient: a.recipient, caption: a.caption, name, voice, reply_to: a.reply_to_message_id };
+        let url = uploads.create(slot)?;
+        json_out(json!({
+            "success": true,
+            "message": "Nothing sent yet: PUT the file to upload_url and the message goes out when the upload completes; \
+                        the response to the PUT is the send result",
+            "upload_url": url,
+            "example": format!("curl -sS -T /path/to/file '{url}'"),
+            "expires_in_seconds": crate::upload::TTL.as_secs(),
+        }))
+    }
+
     async fn send_outgoing(&self, a: SendFileArgs, voice: bool) -> Result<String, Fail> {
         self.allowed_recipient(&a.recipient)?;
         let file = media::outgoing(&self.ctx.paths, self.ctx.allowed_chat(), &a.media_path, &a.content_base64, &a.filename)
@@ -707,7 +753,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&dir.path().join("messages.db")).unwrap());
         let wa = Wa::new(Arc::clone(&store), dir.path().to_path_buf());
-        let ctx = Ctx { store, wa, paths: PathMap::default(), transcriber: None, max_inline: 0, embedder: None, read_only };
+        let uploads = Some(Arc::new(Uploads::new("http://h:8090".into())));
+        let ctx = Ctx { store, wa, paths: PathMap::default(), transcriber: None, max_inline: 0, embedder: None, read_only, uploads };
         (dir, Server::new(Arc::new(ctx)))
     }
 
@@ -757,6 +804,31 @@ mod tests {
             (false, json!("No messages with 1@s.whatsapp.net found."))
         );
         assert_eq!(srv.get_info().server_info.name, "whatsapp-mcp");
+    }
+
+    #[tokio::test]
+    async fn upload_urls_are_handed_out_only_for_a_clean_request() {
+        let (_d, srv) = server(false);
+        let call = |v: serde_json::Value| serde_json::from_value::<SendFileArgs>(v).unwrap();
+        let args = call(json!({ "recipient": "5511900000001", "filename": "../laudo.pdf", "caption": "oi", "return_upload_url": true }));
+        let (is_error, body) = wire(srv.send_file(Parameters(args)).await).unwrap();
+        assert!(!is_error, "{body}");
+        let url = body["upload_url"].as_str().unwrap();
+        let token = url.strip_prefix("http://h:8090/upload/").unwrap();
+        let slot = srv.ctx.uploads.as_ref().unwrap().take(token).unwrap();
+        assert_eq!((slot.name.as_str(), slot.caption.as_str(), slot.voice), ("laudo.pdf", "oi", false));
+        // Voice notes keep the flag.
+        let args = serde_json::from_value(json!({ "recipient": "5511900000001", "filename": "a.mp3", "return_upload_url": true })).unwrap();
+        let (_, body) = wire(srv.send_audio_message(Parameters(args)).await).unwrap();
+        let token = body["upload_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+        assert!(srv.ctx.uploads.as_ref().unwrap().take(&token).unwrap().voice);
+        // Another source alongside is a tool error; no extension or a bad recipient, invalid params.
+        let args = call(json!({ "recipient": "5511900000001", "filename": "a.pdf", "media_path": "/x.pdf", "return_upload_url": true }));
+        assert!(wire(srv.send_file(Parameters(args)).await).unwrap().0);
+        let args = call(json!({ "recipient": "5511900000001", "filename": "semextensao", "return_upload_url": true }));
+        assert_eq!(wire(srv.send_file(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
+        let args = call(json!({ "recipient": "not a number", "filename": "a.pdf", "return_upload_url": true }));
+        assert_eq!(wire(srv.send_file(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]

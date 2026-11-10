@@ -133,16 +133,23 @@ fn read_outgoing(
         let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         return Ok(Outgoing { data, name });
     }
-    let name = Path::new(filename).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if !name.trim_matches('.').contains('.') {
-        bail!("filename with an extension is required with content_base64");
-    }
+    let name = client_name(filename)?;
     // Clients often send a data: URL, or base64 wrapped at 76 columns.
     let b64 = content_base64.trim();
     let b64 = b64.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map_or(b64, |(_, rest)| rest);
     let b64: Vec<u8> = b64.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let data = base64::engine::general_purpose::STANDARD.decode(b64)?;
     Ok(Outgoing { data, name })
+}
+
+/// The name of a file the client supplies the bytes of: basename only, and an
+/// extension, which picks the media type.
+pub fn client_name(filename: &str) -> Result<String> {
+    let name = Path::new(filename).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if !name.trim_matches('.').contains('.') {
+        bail!("filename with an extension is required with content_base64 or return_upload_url");
+    }
+    Ok(name)
 }
 
 /// Where an open file really is, symlinks resolved.

@@ -26,6 +26,6 @@ ENV WHATSAPP_STORE_DIR=/app/whatsapp-bridge/store \
     TMPDIR=/tmp \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER 1000:1000
-EXPOSE 8000 8080
+EXPOSE 8000 8080 8090
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s CMD ["/whatsapp-mcp", "healthcheck"]
 ENTRYPOINT ["/whatsapp-mcp"]

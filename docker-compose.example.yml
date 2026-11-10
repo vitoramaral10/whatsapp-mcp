@@ -9,6 +9,9 @@ services:
         required: false
     ports:
       - "127.0.0.1:8000:8000" # MCP; no authentication, keep it on localhost
+      # Upload URLs for send_file from the client's disk (WHATSAPP_UPLOAD_URL in .env);
+      # bind to the address your clients reach, e.g. a VPN IP.
+      # - "100.64.0.1:8090:8090"
     volumes:
       - ./store:/app/whatsapp-bridge/store
     read_only: true
