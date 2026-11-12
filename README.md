@@ -91,7 +91,9 @@ deployments keep working.
 
 - **search_contacts**: contacts by name or phone number
 - **search_messages**: best matches first, by meaning (embeddings) and by words (SQLite FTS5),
-  merged by reciprocal rank; full-text only when no embedding server is set
+  merged by reciprocal rank; full-text only when no embedding server is set; each message is
+  embedded with up to 4 earlier messages of its conversation (within 2 hours), so a short reply is
+  found by the topic it answers, and one stretch of chat takes one result slot
 - **list_messages**: messages with filters (date, sender, chat, words via FTS5) and surrounding context
 - **list_chats** (`unread_only`), **get_chat**, **get_direct_chat_by_contact**, **get_contact_chats**
 - **get_last_interaction**, **get_message_context**
