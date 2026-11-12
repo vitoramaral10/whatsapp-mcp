@@ -17,6 +17,9 @@ and versions follow [Semantic Versioning](https://semver.org).
 - CI (fmt, clippy, tests, Docker build), security policy, compose and `.env` examples.
 
 ### Changed
+- Semantic search embeds each message with up to 4 earlier messages of its conversation (within
+  2 hours), so short replies are found by what they answer; neighbouring hits of one conversation
+  collapse into one. Existing vectors are dropped once on upgrade and re-embedded in the background.
 - The repository is no longer a GitHub fork of lharries/whatsapp-mcp; the credit stays in the
   README and the license.
 - The REST API honours `WHATSAPP_READ_ONLY` and `WHATSAPP_ALLOWED_CHATS`, and listens on

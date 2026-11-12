@@ -44,7 +44,32 @@ const BEST_NAME: &str = "COALESCE(NULLIF(full_name, ''), NULLIF(business_name, '
 pub const EDITED: &str = "[edited] ";
 pub const DELETED: &str = "[deleted] ";
 pub const TRANSCRIBED: &str = "[transcription] ";
+/// A window needs one line this long to get a vector: one of only short
+/// replies ("ok", "kk") sits near any query and buries the real matches.
 const MIN_SEMANTIC_CHARS: usize = 15;
+/// A message is embedded with up to this many messages before it in its chat,
+/// so a reply like "sim, fechado" carries what it answers.
+const WINDOW: i64 = 4;
+/// Earlier messages further back than this belong to another conversation.
+const WINDOW_GAP_SECS: i64 = 2 * 3600;
+/// Characters per window (about 500 tokens); the message itself comes first,
+/// the context fills what is left, each earlier message cut at CONTEXT_LINE_CHARS.
+const WINDOW_CHARS: usize = 1500;
+const CONTEXT_LINE_CHARS: usize = 300;
+/// Bumped when what a vector encodes changes, so older vectors are dropped.
+/// 1: windows of messages instead of single messages.
+const VECTORS_VERSION: i64 = 1;
+
+/// SQL that is true when the message (`p` is "", "new." or "old.") has text
+/// that windows are made of: reactions and attachments without a caption are not.
+fn embeddable(p: &str) -> String {
+    format!("(COALESCE({p}content, '') <> '' AND {p}content NOT LIKE '[reacted %')")
+}
+
+/// Whether a window has too little text for a vector (see MIN_SEMANTIC_CHARS).
+pub fn too_short(window: &str) -> bool {
+    window.lines().all(|l| l.chars().count() < MIN_SEMANTIC_CHARS)
+}
 
 /// SQL that is true when `col` holds a transcript or starts with an edit or
 /// deletion marker. Parameters ?n, ?n+1 and ?n+2 must bind `MARKERS`.
@@ -233,6 +258,84 @@ fn dot(blob: &[u8], q: &[f32]) -> f32 {
     blob.as_chunks::<4>().0.iter().zip(q).map(|(b, x)| f32::from_le_bytes(*b) * x).sum()
 }
 
+/// Up to `k` embeddable messages of `chat` right before (or after) the one at
+/// (`ts`, `rowid`), nearest first, as (rowid, timestamp, content).
+fn neighbours(db: &Connection, chat: &str, ts: &str, rowid: i64, after: bool, k: i64) -> Result<Vec<(i64, String, String)>> {
+    let (op, ord) = if after { (">", "ASC") } else { ("<", "DESC") };
+    let mut stmt = db.prepare_cached(&format!(
+        "SELECT rowid, timestamp, content FROM messages
+         WHERE chat_jid = ?1 AND (timestamp, rowid) {op} (?2, ?3) AND {}
+         ORDER BY timestamp {ord}, rowid {ord} LIMIT ?4",
+        embeddable("")
+    ))?;
+    let rows = stmt.query_map(params![chat, ts, rowid, k], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Whether two stored timestamps are within one window's gap.
+fn close_in_time(a: &str, b: &str) -> bool {
+    match (parse_ts(a), parse_ts(b)) {
+        (Some(a), Some(b)) => (a - b).num_seconds().abs() <= WINDOW_GAP_SECS,
+        _ => false,
+    }
+}
+
+/// The text a message's vector encodes: the earlier messages of the same
+/// conversation, oldest first, then the message itself on the last line.
+/// None when the message is gone or has no text to embed.
+fn window_of(db: &Connection, rowid: i64) -> Result<Option<String>> {
+    let target: Option<(String, String, String)> = db
+        .query_row(&format!("SELECT chat_jid, timestamp, content FROM messages WHERE rowid = ?1 AND {}", embeddable("")), [rowid], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()?;
+    let Some((chat, ts, content)) = target else { return Ok(None) };
+    let mut budget = WINDOW_CHARS.saturating_sub(content.chars().count());
+    let mut lines = Vec::new();
+    for (_, at, text) in neighbours(db, &chat, &ts, rowid, false, WINDOW)? {
+        let line: String = text.chars().take(CONTEXT_LINE_CHARS).collect();
+        let cost = line.chars().count() + 1;
+        if !close_in_time(&ts, &at) || cost > budget {
+            break;
+        }
+        budget -= cost;
+        lines.push(line);
+    }
+    lines.reverse();
+    lines.push(content);
+    Ok(Some(lines.join("\n")))
+}
+
+/// The first `n` of `ranked` (best first) that are not within a window of a
+/// better one: consecutive messages of one conversation share most of their
+/// windows, and would otherwise fill the results with the same stretch of chat.
+fn distinct_conversations(db: &Connection, ranked: impl Iterator<Item = i64>, n: usize) -> Result<Vec<i64>> {
+    let mut covered = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    for rowid in ranked {
+        if kept.len() == n {
+            break;
+        }
+        if covered.contains(&rowid) {
+            continue;
+        }
+        let at: Option<(String, String)> = db
+            .query_row("SELECT chat_jid, timestamp FROM messages WHERE rowid = ?1", [rowid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((chat, ts)) = at else { continue };
+        for after in [false, true] {
+            for (id, t, _) in neighbours(db, &chat, &ts, rowid, after, WINDOW)? {
+                if !close_in_time(&ts, &t) {
+                    break;
+                }
+                covered.insert(id);
+            }
+        }
+        kept.push(rowid);
+    }
+    Ok(kept)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut db = connect(path)?;
@@ -316,6 +419,40 @@ impl Store {
                  embedding BLOB NOT NULL
              );",
         )?;
+        // A vector encodes its message's window (window_of), so a message that
+        // arrives, changes or leaves also drops the vectors of the WINDOW
+        // messages after it, which get re-embedded with the new context.
+        let next = |p: &str| {
+            format!(
+                "DELETE FROM message_vec WHERE rowid IN (SELECT rowid FROM messages
+                     WHERE chat_jid = {p}chat_jid AND (timestamp, rowid) > ({p}timestamp, {p}rowid)
+                       AND rowid <> {p}rowid AND {e} ORDER BY timestamp, rowid LIMIT {WINDOW});",
+                e = embeddable("")
+            )
+        };
+        tx.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS message_vec_ai;
+                 CREATE TRIGGER message_vec_ai AFTER INSERT ON messages WHEN {new_e} BEGIN {next_new} END;
+                 DROP TRIGGER IF EXISTS message_vec_ad;
+                 CREATE TRIGGER message_vec_ad AFTER DELETE ON messages WHEN {old_e} BEGIN {next_old} END;
+                 DROP TRIGGER IF EXISTS message_vec_au;
+                 CREATE TRIGGER message_vec_au AFTER UPDATE OF content, timestamp, chat_jid ON messages
+                 WHEN old.content IS NOT new.content OR old.timestamp IS NOT new.timestamp OR old.chat_jid IS NOT new.chat_jid
+                 BEGIN
+                     DELETE FROM message_vec WHERE rowid = new.rowid;
+                     {next_old}
+                     {next_new}
+                 END;",
+            new_e = embeddable("new."),
+            old_e = embeddable("old."),
+            next_new = next("new."),
+            next_old = next("old."),
+        ))?;
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < VECTORS_VERSION {
+            tx.execute("DELETE FROM message_vec", [])?;
+            tx.execute_batch(&format!("PRAGMA user_version = {VECTORS_VERSION};"))?;
+        }
         if !has_fts {
             tx.execute("INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')", [])?;
         }
@@ -774,33 +911,39 @@ impl Store {
 
     // ---- semantic search -----------------------------------------------------
 
-    /// Newest messages with no vector yet and enough text for one (search
-    /// ignores shorter ones and reactions). Read through the MCP connection:
-    /// with an allowlist only the chats search can return get embedded.
+    /// Newest messages with text and no vector yet, each with its window
+    /// (window_of). Read through the MCP connection: with an allowlist only the
+    /// chats search can return get embedded. Windows `too_short` for a vector
+    /// still come back, for the caller to mark with an empty one.
     pub fn unembedded(&self, n: usize) -> Result<Vec<(i64, String)>> {
         let db = self.reads();
         let mut stmt = db.prepare(&format!(
-            "SELECT m.rowid, m.content FROM messages m LEFT JOIN message_vec v ON v.rowid = m.rowid
-             WHERE v.rowid IS NULL AND length(m.content) >= {MIN_SEMANTIC_CHARS} AND m.content NOT LIKE '[reacted %'
-             ORDER BY m.timestamp DESC, m.rowid DESC LIMIT ?1"
+            "SELECT m.rowid FROM messages m LEFT JOIN message_vec v ON v.rowid = m.rowid
+             WHERE v.rowid IS NULL AND {} ORDER BY m.timestamp DESC, m.rowid DESC LIMIT ?1",
+            embeddable("m.")
         ))?;
-        let rows = stmt.query_map([n as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
+        let ids: Vec<i64> = stmt.query_map([n as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(w) = window_of(&db, id)? {
+                out.push((id, w));
+            }
+        }
+        Ok(out)
     }
 
-    /// Stores (rowid, text embedded, vector) rows whose message still holds that
-    /// text: an edit while the batch was out would otherwise get a stale vector.
-    /// Returns how many were saved.
+    /// Stores (rowid, window embedded, vector) rows whose window is still that
+    /// text: a message edited or arriving in it while the batch was out would
+    /// otherwise leave a stale vector. Returns how many were saved.
     pub fn put_vectors(&self, rows: &[(i64, &str, Vec<f32>)]) -> Result<usize> {
         let mut db = self.conn();
         let tx = db.transaction()?;
         let mut saved = 0;
         for (rowid, text, v) in rows {
-            saved += tx.execute(
-                "INSERT OR REPLACE INTO message_vec (rowid, embedding)
-                 SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM messages WHERE rowid = ?1 AND content = ?3)",
-                params![rowid, vec_to_blob(v), text],
-            )?;
+            if window_of(&tx, *rowid)?.as_deref() == Some(*text) {
+                saved +=
+                    tx.execute("INSERT OR REPLACE INTO message_vec (rowid, embedding) VALUES (?1, ?2)", params![rowid, vec_to_blob(v)])?;
+            }
         }
         tx.commit()?;
         Ok(saved)
@@ -828,25 +971,27 @@ impl Store {
             add(stmt.query_map(rusqlite::params_from_iter(p), |r| r.get(0))?.collect::<rusqlite::Result<_>>()?);
         }
         if let Some(q) = qvec {
+            // Vectors of another size (another model, or the empty "unembeddable"
+            // mark) can't compare.
             let mut stmt = db.prepare(&format!(
-                // A reply as short as "when?" sits near any question and buries
-                // the real matches; words alone still find it. Vectors of another
-                // size (another model, or the empty "unembeddable" mark) can't compare.
                 "SELECT message_vec.rowid, message_vec.embedding FROM message_vec
                  JOIN messages ON messages.rowid = message_vec.rowid
-                 WHERE length(message_vec.embedding) = {} AND length(messages.content) >= {MIN_SEMANTIC_CHARS} AND {filter}",
+                 WHERE length(message_vec.embedding) = {} AND {filter}",
                 4 * q.len()
             ))?;
             let mut best: Vec<(f32, i64)> = stmt
                 .query_map(rusqlite::params_from_iter(args.iter()), |r| Ok((dot(&r.get::<_, Vec<u8>>(1)?, q), r.get(0)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             let by_score = |a: &(f32, i64), b: &(f32, i64)| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1));
-            if best.len() > POOL {
-                best.select_nth_unstable_by(POOL, by_score);
-                best.truncate(POOL);
+            // Neighbouring windows share most of their text and score alike;
+            // room for the ones dropped below.
+            let room = POOL * 4;
+            if best.len() > room {
+                best.select_nth_unstable_by(room, by_score);
+                best.truncate(room);
             }
             best.sort_unstable_by(by_score);
-            add(best.into_iter().map(|(_, id)| id).collect());
+            add(distinct_conversations(&db, best.into_iter().map(|(_, id)| id), POOL)?);
         }
         let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
         ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
@@ -1281,7 +1426,10 @@ mod tests {
     #[test]
     fn hybrid_search_merges_words_and_vectors_and_edits_drop_stale_vectors() {
         let (_d, s) = temp_store();
-        chat_with(&s, "55@s.whatsapp.net", &[("A", "passagem comprada"), ("B", "bolo de cenoura"), ("C", "viagem de férias")]);
+        // One message per chat: three separate conversations.
+        chat_with(&s, "1@s.whatsapp.net", &[("A", "passagem comprada")]);
+        chat_with(&s, "2@s.whatsapp.net", &[("B", "bolo de cenoura")]);
+        chat_with(&s, "3@s.whatsapp.net", &[("C", "viagem de férias")]);
         let rows = s.unembedded(10).unwrap();
         assert_eq!(rows.len(), 3);
         let axis = |i: usize| (0..3).map(|j| if i == j { 1.0 } else { 0.0 }).collect::<Vec<f32>>();
@@ -1291,7 +1439,7 @@ mod tests {
         assert_eq!(saved.unwrap(), 3);
         assert!(s.unembedded(10).unwrap().is_empty());
         // The same text arriving again keeps its vector.
-        chat_with(&s, "55@s.whatsapp.net", &[("A", "passagem comprada")]);
+        chat_with(&s, "1@s.whatsapp.net", &[("A", "passagem comprada")]);
         assert!(s.unembedded(10).unwrap().is_empty());
         let f = MessageFilter { limit: 2, ..Default::default() };
         let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
@@ -1301,7 +1449,7 @@ mod tests {
         assert_eq!(ids(s.search("cenoura", None, &f).unwrap()), ["B"]);
         // A vector of another size never compares.
         assert_eq!(ids(s.search("xyz", Some(&[1.0, 0.0]), &f).unwrap()), Vec::<String>::new());
-        s.edit_message("B", "55@s.whatsapp.net", "torta de chocolate").unwrap();
+        s.edit_message("B", "2@s.whatsapp.net", "torta de chocolate").unwrap();
         assert_eq!(s.unembedded(10).unwrap().len(), 1);
         // A vector for the text before the edit is not saved.
         assert_eq!(s.put_vectors(&[(by_text["bolo de cenoura"], "bolo de cenoura", axis(1))]).unwrap(), 0);
@@ -1309,21 +1457,83 @@ mod tests {
     }
 
     #[test]
-    fn short_replies_are_found_by_words_but_not_by_meaning() {
+    fn a_vector_encodes_the_message_with_the_ones_before_it() {
         let (_d, s) = temp_store();
-        chat_with(&s, "55@s.whatsapp.net", &[("A", "Quando ?"), ("B", "que dia eles vão viajar?")]);
-        chat_with(&s, "55@s.whatsapp.net", &[("C", "[reacted 👍 to: que dia eles vão viajar?]")]);
-        let rows = s.unembedded(10).unwrap();
+        let jid = "55@s.whatsapp.net";
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        s.store_chat(jid, "Ana", t).unwrap();
+        let msg = |id: &str, min: i64, text: &str| {
+            s.store_message(id, jid, "55", text, t + chrono::Duration::minutes(min), false, &Media::default()).unwrap()
+        };
+        msg("A", 0, "bom dia, tudo certo para amanhã?");
+        msg("B", 300, "que dia eles vão viajar?");
+        msg("C", 301, "[reacted 👍 to: que dia eles vão viajar?]");
+        msg("D", 302, "dia 20");
+        msg("E", 303, "sim, fechado");
+        let windows = |s: &Store| {
+            let mut w = s.unembedded(10).unwrap();
+            w.sort();
+            w.into_iter().map(|(_, t)| t).collect::<Vec<_>>()
+        };
+        // A is five hours before B: another conversation. The reaction is no context.
         assert_eq!(
-            rows.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
-            ["que dia eles vão viajar?"],
-            "short texts and reactions get no vector"
+            windows(&s),
+            [
+                "bom dia, tudo certo para amanhã?",
+                "que dia eles vão viajar?",
+                "que dia eles vão viajar?\ndia 20",
+                "que dia eles vão viajar?\ndia 20\nsim, fechado",
+            ]
         );
-        s.put_vectors(&rows.iter().map(|(r, t)| (*r, t.as_str(), vec![1.0_f32])).collect::<Vec<_>>()).unwrap();
+        assert!(!too_short("que dia eles vão viajar?\ndia 20"));
+        assert!(too_short("ok\nkk\nsim"));
+        let rows = s.unembedded(10).unwrap();
+        let saved = s.put_vectors(&rows.iter().map(|(r, t)| (*r, t.as_str(), vec![1.0_f32])).collect::<Vec<_>>()).unwrap();
+        assert_eq!(saved, 4);
+        // A message synced late into the conversation changes the windows after it, and only those.
+        msg("X", 301, "acho que de avião");
+        // By rowid: D and E, whose windows now hold X, then X itself; B keeps its vector.
+        assert_eq!(
+            windows(&s),
+            [
+                "que dia eles vão viajar?\nacho que de avião\ndia 20",
+                "que dia eles vão viajar?\nacho que de avião\ndia 20\nsim, fechado",
+                "que dia eles vão viajar?\nacho que de avião",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_conversation_takes_one_semantic_slot() {
+        let (_d, s) = temp_store();
+        chat_with(
+            &s,
+            "1@s.whatsapp.net",
+            &[("A", "vamos viajar em março"), ("B", "para onde exatamente?"), ("C", "talvez Floripa de carro")],
+        );
+        chat_with(&s, "2@s.whatsapp.net", &[("D", "a viagem foi cancelada")]);
+        let rows = s.unembedded(10).unwrap();
+        // The three windows of chat 1 score alike, chat 2 a bit lower.
+        let v = |r: i64| if rows.iter().any(|(x, t)| *x == r && t.contains("cancelada")) { vec![0.8_f32, 0.6] } else { vec![1.0, 0.0] };
+        s.put_vectors(&rows.iter().map(|(r, t)| (*r, t.as_str(), v(*r))).collect::<Vec<_>>()).unwrap();
         let f = MessageFilter { limit: 5, ..Default::default() };
         let ids = |v: Vec<Message>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
-        assert_eq!(ids(s.search("xyz", Some(&[1.0]), &f).unwrap()), ["B"]);
-        assert_eq!(ids(s.search("quando", None, &f).unwrap()), ["A"]);
+        // Ties go to the newer message: C stands for its conversation, then D.
+        assert_eq!(ids(s.search("xyz", Some(&[1.0, 0.0]), &f).unwrap()), ["C", "D"]);
+    }
+
+    #[test]
+    fn vectors_from_before_windows_are_dropped_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.db");
+        let s = Store::open(&path).unwrap();
+        chat_with(&s, "1@s.whatsapp.net", &[("A", "passagem comprada")]);
+        let rows = s.unembedded(10).unwrap();
+        s.put_vectors(&[(rows[0].0, rows[0].1.as_str(), vec![1.0])]).unwrap();
+        drop(s);
+        assert!(Store::open(&path).unwrap().unembedded(10).unwrap().is_empty(), "current vectors stay");
+        Connection::open(&path).unwrap().execute_batch("PRAGMA user_version = 0;").unwrap();
+        assert_eq!(Store::open(&path).unwrap().unembedded(10).unwrap().len(), 1);
     }
 
     #[test]

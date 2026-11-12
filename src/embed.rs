@@ -1,6 +1,7 @@
 //! Message embeddings for semantic search, from an OpenAI-compatible
 //! /v1/embeddings server, such as llama.cpp's llama-server.
-//! A background loop gives every message with text a vector, newest first.
+//! A background loop gives every message with text a vector, newest first;
+//! each vector encodes the message with the ones before it (see store::window_of).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,10 +10,10 @@ use anyhow::{Context, Result, bail};
 use log::{info, warn};
 use serde_json::{Value, json};
 
-use crate::store::Store;
+use crate::store::{Store, too_short};
 
 const BATCH: usize = 32;
-/// Characters per message sent to the model (about 500 tokens, under the
+/// Characters per text sent to the model (about 500 tokens, under the
 /// server's 1024-token batch); longer text is cut, not split.
 const MAX_CHARS: usize = 1500;
 /// Backfill batches can queue behind each other on a busy server.
@@ -93,21 +94,32 @@ impl Embedder {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
-            let texts: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
-            let (vecs, mut pause) = match self.embed(&texts).await {
-                Ok(vecs) => (vecs.into_iter().map(Some).collect(), false),
-                Err(e) if self.embed_one("ok").await.is_ok() => {
-                    warn!("embedding batch rejected ({e:#}); retrying its {} messages one by one", rows.len());
-                    self.one_by_one(&texts).await
-                }
-                Err(e) => {
-                    warn!("embedding backfill paused: {e:#}");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    continue;
+            // Windows too short for a vector get the empty "unembeddable" mark.
+            let texts: Vec<String> = rows.iter().filter(|(_, t)| !too_short(t)).map(|(_, t)| t.clone()).collect();
+            let (vecs, mut pause) = if texts.is_empty() {
+                (Vec::new(), false)
+            } else {
+                match self.embed(&texts).await {
+                    Ok(vecs) => (vecs.into_iter().map(Some).collect(), false),
+                    Err(e) if self.embed_one("ok").await.is_ok() => {
+                        warn!("embedding batch rejected ({e:#}); retrying its {} messages one by one", texts.len());
+                        self.one_by_one(&texts).await
+                    }
+                    Err(e) => {
+                        warn!("embedding backfill paused: {e:#}");
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
                 }
             };
-            let triples: Vec<(i64, &str, Vec<f32>)> =
-                rows.iter().zip(vecs).filter_map(|((id, t), v)| Some((*id, t.as_str(), v?))).collect();
+            let mut vecs = vecs.into_iter();
+            let triples: Vec<(i64, &str, Vec<f32>)> = rows
+                .iter()
+                .filter_map(|(id, t)| {
+                    let v = if too_short(t) { Some(Vec::new()) } else { vecs.next().flatten() };
+                    Some((*id, t.as_str(), v?))
+                })
+                .collect();
             match store.put_vectors(&triples) {
                 Ok(saved) => {
                     let before = done;
