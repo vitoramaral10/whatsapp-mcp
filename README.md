@@ -164,7 +164,7 @@ over, so the device has to be paired again. The MCP tools keep their names and p
 
 ## Development
 
-Building needs Rust 1.99+, cmake, a C/C++ compiler and perl: libopus and SQLite are compiled
+Building needs Rust 1.100+, cmake, a C/C++ compiler and perl: libopus and SQLite are compiled
 from source, and [`.cargo/config.toml`](.cargo/config.toml) sets the flags. The `simd` feature of
 whatsapp-rust needs nightly and stays disabled.
 
