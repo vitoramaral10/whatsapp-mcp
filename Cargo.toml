@@ -2,7 +2,7 @@
 name = "whatsapp-mcp"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "MCP server for a personal WhatsApp account: search, read and send messages, media and voice notes"
 license = "MIT"
 repository = "https://github.com/vitoramaral10/whatsapp-mcp"
@@ -46,3 +46,6 @@ codegen-units = 1
 # A decoder panic on attacker-supplied media must stay inside its spawn_blocking task, not kill the server.
 panic = "unwind"
 strip = true
+
+[lints.cargo]
+unused_dependencies = "warn"

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Static musl binary on an empty base: no shell, no libc, no package manager.
 # libopus and SQLite are compiled in from source; TLS is rustls.
-FROM rust:1.99.1-alpine3.24@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS build
+FROM rust:1.100.0-alpine3.24@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS build
 RUN apk add --no-cache musl-dev cmake make g++ perl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
