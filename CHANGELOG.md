@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-15
+
 ### Added
 - `return_upload_url` in `send_file` and `send_audio_message`: a one-shot URL the client PUTs
   a file from its own disk to (`curl -T`), sent when the upload completes. Served on its own
@@ -55,6 +57,9 @@ and versions follow [Semantic Versioning](https://semver.org).
 - Auto-transcription no longer starves on failed notes or stops for a whisper outage.
 - Faster unread counts and contact lookups through new indexes.
 
+### Security
+- `rmcp` 3.10, which fixes RUSTSEC-2026-0462.
+
 ## [0.2.0] - 2026-11-03
 
 ### Changed
@@ -70,5 +75,6 @@ and versions follow [Semantic Versioning](https://semver.org).
 - Docker deployment of the lharries/whatsapp-mcp Go bridge and Python server, on which this
   project started.
 
-[Unreleased]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vitoramaral10/whatsapp-mcp/releases/tag/v0.2.0
