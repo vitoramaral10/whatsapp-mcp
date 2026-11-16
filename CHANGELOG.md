@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
+### Security
+- `opus` 0.4 links libopus through the maintained `opusic-sys` instead of the unmaintained `audiopus_sys`
+  (RUSTSEC-2026-0150).
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
@@ -75,6 +81,7 @@ and versions follow [Semantic Versioning](https://semver.org).
 - Docker deployment of the lharries/whatsapp-mcp Go bridge and Python server, on which this
   project started.
 
-[Unreleased]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vitoramaral10/whatsapp-mcp/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vitoramaral10/whatsapp-mcp/releases/tag/v0.2.0
