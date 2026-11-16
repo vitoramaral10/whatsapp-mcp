@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-mcp"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.100"
 description = "MCP server for a personal WhatsApp account: search, read and send messages, media and voice notes"
