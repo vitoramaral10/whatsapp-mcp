@@ -18,7 +18,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 mime_guess = "2"
 ogg = "0.9"
-opus = "0.3"
+opus = "0.4"
 qrcode = { version = "0.14", default-features = false }
 # reqwest only talks plain HTTP to the whisper and embedding servers: no TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "json"] }
