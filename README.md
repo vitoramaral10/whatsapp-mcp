@@ -72,6 +72,7 @@ Clients that only speak stdio can go through [`mcp-remote`](https://www.npmjs.co
 | `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | MCP listener |
 | `WHATSAPP_API_HOST` / `WHATSAPP_API_PORT` | `MCP_HOST` / `8080` | REST API listener |
 | `WHATSAPP_SEND_DIRS` | store dir | `:`-separated directories `send_file` and `/api/send` may read from; databases and files in the store root are always refused |
+| `WHATSAPP_ATTACHMENT_DIR` | unset | Directory the Google Workspace MCP saves attachments to (its `WORKSPACE_ATTACHMENT_DIR`, shared with this container and inside a send dir): `send_file` then takes its `…/attachments/<id>` download URLs as `media_path` |
 | `WHATSAPP_UPLOAD_URL` | — | Public base URL of the upload listener (e.g. `http://homelab:8090`); turns on `return_upload_url` in `send_file` and `send_audio_message` |
 | `WHATSAPP_UPLOAD_HOST` / `WHATSAPP_UPLOAD_PORT` | `MCP_HOST` / `8090` | Upload listener; it serves only `PUT /upload/<token>` and starts only with `WHATSAPP_UPLOAD_URL` set |
 | `WHATSAPP_MEDIA_HOST_PATH` | — | Host side of the store bind mount, so returned paths open on the host |

@@ -14,6 +14,9 @@ pub struct PathMap {
     pub host: String,
     /// The only directories send_* reads from.
     pub send_dirs: Vec<PathBuf>,
+    /// Where the Google Workspace MCP saves the files behind its download URLs;
+    /// empty turns URLs off.
+    pub attachments: String,
 }
 
 impl PathMap {
@@ -32,6 +35,42 @@ impl PathMap {
             Some(rest) if !host.is_empty() && rest.starts_with('/') => format!("{}{}", self.container.trim_end_matches('/'), rest),
             _ => path.to_string(),
         }
+    }
+
+    /// A Google Workspace MCP download URL (`http://…/attachments/<id>`) as the
+    /// file behind it and the name to show: that server saves it in a shared
+    /// directory as `<stem>_<id>.<ext>`, or `<id>.<ext>` when it had no name,
+    /// and its URL only works inside its own container. None for a plain path.
+    fn attachment(&self, media_path: &str) -> Result<Option<(PathBuf, String)>> {
+        if !media_path.starts_with("http://") && !media_path.starts_with("https://") {
+            return Ok(None);
+        }
+        let id = media_path.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/');
+        let Some((_, id)) = id.rsplit_once("/attachments/") else {
+            bail!("only Google Workspace download URLs (…/attachments/<id>) are accepted, not {media_path}");
+        };
+        if self.attachments.is_empty() {
+            bail!("download URLs are off: WHATSAPP_ATTACHMENT_DIR is not set");
+        }
+        if id.is_empty() || sanitize(id) != id {
+            bail!("malformed attachment id in {media_path}");
+        }
+        let suffix = format!("_{id}");
+        for entry in std::fs::read_dir(&self.attachments)? {
+            let path = entry?.path();
+            let (Some(stem), ext) = (path.file_stem().and_then(|s| s.to_str()), path.extension().and_then(|e| e.to_str())) else {
+                continue;
+            };
+            let shown = if stem == id {
+                Some(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            } else {
+                stem.strip_suffix(&suffix).map(|s| ext.map_or(s.to_string(), |e| format!("{s}.{e}")))
+            };
+            if let Some(shown) = shown {
+                return Ok(Some((path, shown)));
+            }
+        }
+        bail!("attachment {id} not found: it expires an hour after download, fetch it again")
     }
 }
 
@@ -113,7 +152,10 @@ fn read_outgoing(
         if media_path.is_empty() {
             bail!("media_path or content_base64 is required");
         }
-        let path = paths.to_container(media_path);
+        let (path, shown) = match paths.attachment(media_path)? {
+            Some((path, shown)) => (path.to_string_lossy().into_owned(), Some(shown)),
+            None => (paths.to_container(media_path), None),
+        };
         let mut file = std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("Media file not found: {path}: {e}"))?;
         // Checked on the file already open, so a path swapped after the check
         // cannot redirect the read.
@@ -130,7 +172,7 @@ fn read_outgoing(
         }
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut data)?;
-        let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = shown.unwrap_or_else(|| real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
         return Ok(Outgoing { data, name });
     }
     let name = client_name(filename)?;
@@ -203,7 +245,7 @@ mod tests {
     use super::*;
 
     fn map() -> PathMap {
-        PathMap { container: "/app/store".into(), host: "/host/store".into(), send_dirs: vec![] }
+        PathMap { container: "/app/store".into(), host: "/host/store".into(), send_dirs: vec![], attachments: String::new() }
     }
 
     #[test]
@@ -214,7 +256,7 @@ mod tests {
         assert_eq!(m.to_container("/host/storeX/a.jpg"), "/host/storeX/a.jpg");
         assert_eq!(m.to_host("/app/storeX/a.jpg"), "/app/storeX/a.jpg");
         assert_eq!(m.to_container("/app/envios/a.jpg"), "/app/envios/a.jpg");
-        let slash = PathMap { container: "/app/store/".into(), host: "/host/store/".into(), send_dirs: vec![] };
+        let slash = PathMap { container: "/app/store/".into(), host: "/host/store/".into(), send_dirs: vec![], attachments: String::new() };
         assert_eq!(slash.to_host("/app/store/c/x.jpg"), "/host/store/c/x.jpg");
         assert_eq!(slash.to_container("/host/store/c/x.jpg"), "/app/store/c/x.jpg");
     }
@@ -280,7 +322,12 @@ mod tests {
             std::fs::write(f, b"x").unwrap();
         }
         std::fs::write(root.path().join("secret.txt"), b"x").unwrap();
-        let m = PathMap { container: store.to_string_lossy().into(), host: String::new(), send_dirs: vec![store.clone(), envios.clone()] };
+        let m = PathMap {
+            container: store.to_string_lossy().into(),
+            host: String::new(),
+            send_dirs: vec![store.clone(), envios.clone()],
+            attachments: String::new(),
+        };
         let path = |p: PathBuf| p.to_string_lossy().into_owned();
         let any = |_: &str| true;
         assert!(read_outgoing(&m, &any, &path(chat.join("x.jpg")), "", "").is_ok());
@@ -313,5 +360,28 @@ mod tests {
         for (c, f) in [("aGk=", "semextensao"), ("aGk=", ""), ("não é base64", "a.txt")] {
             assert!(read_outgoing(&map(), &any, "", c, f).is_err(), "{f}");
         }
+    }
+
+    #[test]
+    fn attachment_urls_resolve_to_the_shared_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("anexos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "0b1c2d3e-aaaa-4bbb-8ccc-123456789abc";
+        std::fs::write(dir.join(format!("boleto_{id}.pdf")), b"%PDF").unwrap();
+        std::fs::write(dir.join("ffff.png"), b"png").unwrap();
+        let m = PathMap { send_dirs: vec![dir.clone()], attachments: dir.to_string_lossy().into(), ..map() };
+        let any = |_: &str| true;
+        let o = read_outgoing(&m, &any, &format!("http://127.0.0.1:8000/attachments/{id}"), "", "").unwrap();
+        assert_eq!((o.name.as_str(), o.data.as_slice()), ("boleto.pdf", &b"%PDF"[..]));
+        assert_eq!(read_outgoing(&m, &any, "https://h/attachments/ffff?x=1", "", "").unwrap().name, "ffff.png");
+        for bad in ["http://h/attachments/nope", "http://h/attachments/..%2F..", "https://example.com/a.pdf", "http://h/attachments/"] {
+            assert!(read_outgoing(&m, &any, bad, "", "").is_err(), "{bad}");
+        }
+        // Outside the send dirs, or with the directory unset, it is refused like any path.
+        let off = PathMap { attachments: String::new(), ..m.clone() };
+        assert!(read_outgoing(&off, &any, &format!("http://h/attachments/{id}"), "", "").is_err());
+        let outside = PathMap { send_dirs: vec![], ..m };
+        assert!(read_outgoing(&outside, &any, &format!("http://h/attachments/{id}"), "", "").is_err());
     }
 }
