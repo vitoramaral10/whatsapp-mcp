@@ -115,6 +115,7 @@ async fn run() -> Result<()> {
             container: store_dir.to_string_lossy().into_owned(),
             host: env("WHATSAPP_MEDIA_HOST_PATH", ""),
             send_dirs: std::env::split_paths(&env("WHATSAPP_SEND_DIRS", &store_dir.to_string_lossy())).collect(),
+            attachments: env("WHATSAPP_ATTACHMENT_DIR", ""),
         },
         transcriber,
         max_inline: env("WHATSAPP_MEDIA_MAX_INLINE_BYTES", "8388608").parse().unwrap_or(8 << 20),

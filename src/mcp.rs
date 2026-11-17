@@ -319,7 +319,8 @@ pub struct SendFileArgs {
     /// or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
     recipient: String,
     /// Path to a file already on the WhatsApp server (e.g. one returned by download_media),
-    /// up to 100 MB. Not a path on the client's machine: for those use return_upload_url.
+    /// up to 100 MB, or the download URL (…/attachments/<id>) that the Gmail and Drive tools
+    /// return, as is. Not a path on the client's machine: for those use return_upload_url.
     #[serde(default)]
     media_path: String,
     /// The file content, base64-encoded (a data: URL prefix is accepted). Only for a few KB
