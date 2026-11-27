@@ -53,13 +53,12 @@ pub struct Server {
     tool_router: ToolRouter<Server>,
 }
 
-/// Why a tool call failed. `Tool` reaches the caller as an `isError` result
-/// with `{"success":false,"message":...}`; `Args` stays a JSON-RPC
-/// invalid_params error, for arguments that are malformed.
+/// Why a tool call failed. It reaches the caller as an `isError` result with
+/// `{"success":false,"message":...}`, bad arguments included, so the model can
+/// read it and correct the call (MCP 2026-07-28).
 #[derive(Debug)]
 enum Fail {
     Tool(String),
-    Args(ErrorData),
 }
 
 impl From<anyhow::Error> for Fail {
@@ -70,7 +69,7 @@ impl From<anyhow::Error> for Fail {
 
 impl From<ErrorData> for Fail {
     fn from(e: ErrorData) -> Self {
-        Fail::Args(e)
+        Fail::Tool(e.message.into_owned())
     }
 }
 
@@ -81,7 +80,6 @@ impl IntoCallToolResult for Fail {
                 let body = json!({ "success": false, "message": message }).to_string();
                 Ok(CallToolResult::error(vec![ContentBlock::text(body)]).into())
             }
-            Fail::Args(e) => Err(e),
         }
     }
 }
@@ -419,12 +417,18 @@ impl Server {
         Self { ctx, tool_router }
     }
 
-    #[tool(description = "Search WhatsApp contacts by name or phone number.")]
+    #[tool(
+        description = "Search WhatsApp contacts by name or phone number.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn search_contacts(&self, Parameters(a): Parameters<QueryArgs>) -> R {
         json_out(self.ctx.store.search_contacts(&a.query)?)
     }
 
-    #[tool(description = "Get WhatsApp messages matching specified criteria with optional context.")]
+    #[tool(
+        description = "Get WhatsApp messages matching specified criteria with optional context.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn list_messages(&self, Parameters(a): Parameters<ListMessagesArgs>) -> R {
         let s = &self.ctx.store;
         let filter = MessageFilter {
@@ -455,7 +459,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Search WhatsApp messages by meaning and by words at once (semantic + full-text, ranked best match first). Prefer this over list_messages' query for questions like \"when did we talk about the trip\": it finds the messages even when they use other words."
+        description = "Search WhatsApp messages by meaning and by words at once (semantic + full-text, ranked best match first). Prefer this over list_messages' query for questions like \"when did we talk about the trip\": it finds the messages even when they use other words.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn search_messages(&self, Parameters(a): Parameters<SearchArgs>) -> R {
         let s = &self.ctx.store;
@@ -481,7 +486,10 @@ impl Server {
         text(format_messages(s, &s.search(&a.query, qvec.as_deref(), &filter)?))
     }
 
-    #[tool(description = "Get WhatsApp chats matching specified criteria.")]
+    #[tool(
+        description = "Get WhatsApp chats matching specified criteria.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn list_chats(&self, Parameters(a): Parameters<ListChatsArgs>) -> R {
         let s = &self.ctx.store;
         json_out(s.list_chats(
@@ -494,7 +502,10 @@ impl Server {
         )?)
     }
 
-    #[tool(description = "Get WhatsApp chat metadata by JID.")]
+    #[tool(
+        description = "Get WhatsApp chat metadata by JID.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn get_chat(&self, Parameters(a): Parameters<GetChatArgs>) -> R {
         match self.ctx.store.get_chat(&a.chat_jid, a.include_last_message)? {
             Some(chat) => json_out(chat),
@@ -502,7 +513,10 @@ impl Server {
         }
     }
 
-    #[tool(description = "Get WhatsApp chat metadata by sender phone number.")]
+    #[tool(
+        description = "Get WhatsApp chat metadata by sender phone number.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn get_direct_chat_by_contact(&self, Parameters(a): Parameters<PhoneArgs>) -> R {
         match self.ctx.store.direct_chat_by_phone(&a.sender_phone_number)? {
             Some(chat) => json_out(chat),
@@ -510,12 +524,18 @@ impl Server {
         }
     }
 
-    #[tool(description = "Get all WhatsApp chats involving the contact.")]
+    #[tool(
+        description = "Get all WhatsApp chats involving the contact.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn get_contact_chats(&self, Parameters(a): Parameters<ContactChatsArgs>) -> R {
         json_out(self.ctx.store.contact_chats(&a.jid, a.limit.min(MAX_LIMIT), a.page)?)
     }
 
-    #[tool(description = "Get most recent WhatsApp message involving the contact.")]
+    #[tool(
+        description = "Get most recent WhatsApp message involving the contact.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn get_last_interaction(&self, Parameters(a): Parameters<JidArgs>) -> R {
         let s = &self.ctx.store;
         match s.last_interaction(&a.jid)? {
@@ -524,7 +544,10 @@ impl Server {
         }
     }
 
-    #[tool(description = "Get context around a specific WhatsApp message.")]
+    #[tool(
+        description = "Get context around a specific WhatsApp message.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
     async fn get_message_context(&self, Parameters(a): Parameters<ContextArgs>) -> R {
         let chat = a.chat_jid.as_deref().filter(|c| !c.is_empty());
         match self.ctx.store.message_context(&a.message_id, chat, a.before.min(MAX_CONTEXT), a.after.min(MAX_CONTEXT))? {
@@ -534,7 +557,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Send a WhatsApp message to a person or group. For group chats use the JID.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send a WhatsApp message to a person or group. For group chats use the JID.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn send_message(&self, Parameters(a): Parameters<SendMessageArgs>) -> R {
         self.allowed_recipient(&a.recipient)?;
@@ -542,7 +566,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Edit the text of a WhatsApp text message you sent. WhatsApp only accepts edits in the first 15 minutes or so after sending.\n\nReturns a dictionary containing success status and a status message"
+        description = "Edit the text of a WhatsApp text message you sent. WhatsApp only accepts edits in the first 15 minutes or so after sending.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn edit_message(&self, Parameters(a): Parameters<EditMessageArgs>) -> R {
         self.allowed_recipient(&a.recipient)?;
@@ -550,7 +575,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Delete a WhatsApp message you sent, for everyone in the chat.\n\nReturns a dictionary containing success status and a status message"
+        description = "Delete a WhatsApp message you sent, for everyone in the chat.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn delete_message(&self, Parameters(a): Parameters<DeleteMessageArgs>) -> R {
         self.allowed_recipient(&a.recipient)?;
@@ -558,7 +584,8 @@ impl Server {
     }
 
     #[tool(
-        description = "React to a WhatsApp message with an emoji, or remove your reaction with an empty emoji.\n\nReturns a dictionary containing success status and a status message"
+        description = "React to a WhatsApp message with an emoji, or remove your reaction with an empty emoji.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn send_reaction(&self, Parameters(a): Parameters<ReactionArgs>) -> R {
         self.allowed_recipient(&a.recipient)?;
@@ -566,7 +593,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Mark every unread message of a WhatsApp chat as read: the senders see blue ticks and the chat shows as read on your phone.\n\nReturns a dictionary containing success status and a status message"
+        description = "Mark every unread message of a WhatsApp chat as read: the senders see blue ticks and the chat shows as read on your phone.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn mark_chat_read(&self, Parameters(a): Parameters<ChatArgs>) -> R {
         self.allowed_recipient(&a.recipient)?;
@@ -574,7 +602,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Everything said in a period, chat by chat (busiest first), with each chat's message and unread counts and its latest messages in order. Made for summaries such as \"what happened today\"."
+        description = "Everything said in a period, chat by chat (busiest first), with each chat's message and unread counts and its latest messages in order. Made for summaries such as \"what happened today\".",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn get_digest(&self, Parameters(a): Parameters<DigestArgs>) -> R {
         let after = iso(&Some(a.after), "after")?.ok_or_else(|| ErrorData::invalid_params("after is required", None))?;
@@ -604,7 +633,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Send a file via WhatsApp to the specified recipient: jpg, png and gif go as pictures, webp as a sticker (no caption), mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message. A file on the client's own machine goes with return_upload_url, never as base64 typed into the call.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send a file via WhatsApp to the specified recipient: jpg, png and gif go as pictures, webp as a sticker (no caption), mp4, avi and mov as videos, .ogg/.opus audio as a voice note, and anything else (other audio included) as a document. For group messages use the JID. To send audio as a voice note in any format, use send_audio_message. A file on the client's own machine goes with return_upload_url, never as base64 typed into the call.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn send_file(&self, Parameters(a): Parameters<SendFileArgs>) -> R {
         if a.return_upload_url {
@@ -614,7 +644,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Send an audio file as a WhatsApp voice note to the specified recipient. For group messages use the JID. MP3, AAC/M4A, WAV, FLAC, Ogg Vorbis and Ogg Opus are accepted, up to 30 minutes and 100 MB; anything but Ogg Opus is converted to Opus. A file on the client's own machine goes with return_upload_url.\n\nReturns a dictionary containing success status and a status message"
+        description = "Send an audio file as a WhatsApp voice note to the specified recipient. For group messages use the JID. MP3, AAC/M4A, WAV, FLAC, Ogg Vorbis and Ogg Opus are accepted, up to 30 minutes and 100 MB; anything but Ogg Opus is converted to Opus. A file on the client's own machine goes with return_upload_url.\n\nReturns a dictionary containing success status and a status message",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn send_audio_message(&self, Parameters(a): Parameters<SendAudioArgs>) -> R {
         let a = SendFileArgs {
@@ -633,7 +664,8 @@ impl Server {
     }
 
     #[tool(
-        description = "Download media from a WhatsApp message and return its content.\n\nReturns a JSON text block with success status, message, file_path, mime_type and size_bytes (plus transcription, transcription_pending or transcription_error for audio), followed by the file itself: an image block for pictures, an embedded resource (base64 blob) for everything else. Files over the inline limit come back as path only."
+        description = "Download media from a WhatsApp message and return its content.\n\nReturns a JSON text block with success status, message, file_path, mime_type and size_bytes (plus transcription, transcription_pending or transcription_error for audio), followed by the file itself: an image block for pictures, an embedded resource (base64 blob) for everything else. Files over the inline limit come back as path only.",
+        annotations(read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
     async fn download_media(&self, Parameters(a): Parameters<DownloadArgs>) -> R {
         // Normalized like a recipient; status@broadcast and the like are kept as given.
@@ -687,7 +719,7 @@ impl Server {
 }
 
 impl Server {
-    /// Checks a recipient: malformed is invalid_params, outside the allowlist a tool error.
+    /// Checks a recipient: malformed or outside the allowlist, a tool error.
     fn allowed_recipient(&self, recipient: &str) -> Result<(), Fail> {
         let jid = crate::wa::recipient_jid(recipient).map_err(invalid)?;
         if !self.ctx.store.allowed(&jid.to_string()) {
@@ -729,11 +761,99 @@ impl Server {
     }
 }
 
+/// How long a client may cache what changes only with a release: discovery and the tool list.
+const STATIC_TTL_MS: u64 = 3_600_000;
+
+/// The key of the confirmation in the MRTR inputRequests.
+const CONFIRM: &str = "confirmar";
+
+/// What the user confirms before a call runs: what goes out to someone else or cannot be undone.
+/// Reactions and marking as read are routine, repeated often, and stay out.
+fn confirm_message(name: &str, args: Option<&JsonObject>) -> Option<String> {
+    let arg = |k: &str| args.and_then(|a| a.get(k)).and_then(serde_json::Value::as_str).unwrap_or_default();
+    let to = arg("recipient");
+    let file = || {
+        [arg("filename"), arg("media_path").rsplit('/').next().unwrap_or_default()].into_iter().find(|f| !f.is_empty()).unwrap_or("arquivo")
+    };
+    let what = match name {
+        "send_message" => format!("Enviar a {to} no WhatsApp a mensagem \"{}\"", arg("message")),
+        "send_file" => format!("Enviar o arquivo {} a {to} no WhatsApp", file()),
+        "send_audio_message" => format!("Enviar o áudio {} a {to} no WhatsApp, como mensagem de voz", file()),
+        "edit_message" => format!("Trocar o texto da mensagem {} na conversa com {to} por \"{}\"", arg("message_id"), arg("message")),
+        "delete_message" => format!("Apagar para todos a mensagem {} na conversa com {to}", arg("message_id")),
+        _ => return None,
+    };
+    Some(format!("{what}. Não dá para desfazer. Confirma?"))
+}
+
+/// Asks the user, by elicitation, before a call that sends or cannot be undone; None lets it run.
+///
+/// A client that cannot ask goes on as before: no form elicitation in this request, or a session
+/// older than 2026-07-28, where input_required would reach it as a protocol error.
+fn confirmation(request: &CallToolRequestParams, context: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<CallToolResponse> {
+    let modern = context.protocol_version().is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+    // elicitation {} with no mode counts as form (spec compatibility).
+    let form = context.client_capabilities().and_then(|c| c.elicitation).is_some_and(|e| e.form.is_some() || e.url.is_none());
+    if !(modern && form) {
+        return None;
+    }
+    let message = confirm_message(&request.name, request.arguments.as_ref())?;
+    let Some(answer) = request.input_responses.as_ref().and_then(|r| r.get(CONFIRM)) else {
+        let ask = ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message,
+            requested_schema: ElicitationSchema::new(Default::default()),
+        };
+        let asks = std::collections::BTreeMap::from([(CONFIRM.to_string(), InputRequest::Elicitation(ElicitRequest::new(ask)))]);
+        return Some(InputRequiredResult::from_input_requests(asks).into());
+    };
+    // Anything but a well-formed accept counts as no.
+    if serde_json::from_value::<ElicitResult>(answer.clone()).is_ok_and(|r| r.action == ElicitationAction::Accept) {
+        return None;
+    }
+    let body =
+        json!({ "success": false, "message": "O usuário não confirmou; nada foi enviado nem alterado. Não tente de novo sem ele pedir." });
+    Some(CallToolResult::success(vec![ContentBlock::text(body.to_string())]).into())
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Server {
+    /// The discovery result changes only with a new release: the same for every caller.
+    async fn discover(&self, _context: rmcp::service::RequestContext<rmcp::RoleServer>) -> Result<DiscoverResult, ErrorData> {
+        Ok(DiscoverResult::from_server_info(self.supported_protocol_versions().into_owned(), self.get_info())
+            .with_ttl_ms(STATIC_TTL_MS)
+            .with_cache_scope(CacheScope::Public))
+    }
+
+    /// The tool list is fixed at startup (read-only mode) and holds no account data.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        // Peers before 2026-07-28 do not know the hints.
+        let hints = context.protocol_version().is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+        let mut result = ListToolsResult::with_all_items(self.tool_router.list_all());
+        if hints {
+            result = result.with_ttl_ms(STATIC_TTL_MS).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(early) = confirmation(&request, &context) {
+            return Ok(early);
+        }
+        self.tool_router.call(rmcp::handler::server::tool::ToolCallContext::new(self, request, context)).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("whatsapp-mcp", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("whatsapp-mcp", env!("CARGO_PKG_VERSION")).with_title("WhatsApp"))
             .with_instructions(
                 "Tools over one personal WhatsApp account and its stored message history. Find a chat with \
                  search_contacts or list_chats, read it with list_messages, get_message_context or get_digest, \
@@ -777,6 +897,196 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_tool_declares_all_four_hints() {
+        // Hosts warn before destructive calls only when the hints are set (destructiveHint absent reads as true).
+        let (_a, full) = server(false);
+        let (_b, ro) = server(true);
+        for t in full.tool_router.list_all() {
+            let a = t.annotations.as_ref().unwrap_or_else(|| panic!("{} has no annotations", t.name));
+            let read_only = a.read_only_hint.unwrap_or_else(|| panic!("{}: no read_only_hint", t.name));
+            assert!(a.destructive_hint.is_some() && a.idempotent_hint.is_some() && a.open_world_hint.is_some(), "{}: missing hint", t.name);
+            assert_eq!(
+                read_only,
+                ro.tool_router.get(t.name.as_ref()).is_some(),
+                "{}: read_only_hint disagrees with read-only mode",
+                t.name
+            );
+            assert_eq!(confirm_message(&t.name, None).is_some(), CONFIRMED.contains(&t.name.as_ref()), "{}", t.name);
+        }
+    }
+
+    const CONFIRMED: [&str; 5] = ["send_message", "send_file", "send_audio_message", "edit_message", "delete_message"];
+
+    /// The server as main serves it, on a free port, with a real rmcp client on the other end.
+    mod end_to_end {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rmcp::service::{ClientLifecycleMode, ClientServiceExt, RequestContext, RunningService};
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        };
+        use rmcp::{RoleClient, ServiceExt};
+        use serde_json::Value;
+
+        use super::*;
+
+        /// The user behind the client: what they answer, and how many times they were asked.
+        /// `None` is a client that declares no elicitation.
+        #[derive(Clone)]
+        struct User {
+            answer: Option<ElicitationAction>,
+            asked: Arc<AtomicUsize>,
+            seen: Arc<std::sync::Mutex<String>>,
+        }
+
+        impl rmcp::ClientHandler for User {
+            fn get_info(&self) -> ClientConfig {
+                // What the gateway forwards: the form mode, spelled out.
+                let caps = if self.answer.is_some() { json!({"elicitation": {"form": {}}}) } else { json!({}) };
+                ClientConfig::new(serde_json::from_value(caps).unwrap(), Implementation::new("teste", "1"))
+            }
+
+            async fn create_elicitation(
+                &self,
+                request: ElicitRequestParams,
+                _context: RequestContext<RoleClient>,
+            ) -> Result<ElicitResult, ErrorData> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                if let ElicitRequestParams::FormElicitationParams { message, .. } = request {
+                    *self.seen.lock().unwrap() = message;
+                }
+                Ok(ElicitResult::new(self.answer.clone().expect("asked a client without elicitation")))
+            }
+        }
+
+        fn user(answer: Option<ElicitationAction>) -> User {
+            User { answer, asked: Arc::new(AtomicUsize::new(0)), seen: Default::default() }
+        }
+
+        async fn serve() -> (tempfile::TempDir, String) {
+            let (dir, srv) = server(false);
+            let service = StreamableHttpService::new(
+                move || Ok(srv.clone()),
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig::default().disable_allowed_hosts(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            tokio::spawn(axum::serve(listener, axum::Router::new().nest_service("/mcp", service)).into_future());
+            (dir, url)
+        }
+
+        async fn connect(url: &str, user: &User, modern: bool) -> RunningService<RoleClient, User> {
+            let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+            if modern {
+                let lifecycle = ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] };
+                user.clone().serve_with_lifecycle(transport, lifecycle).await.unwrap()
+            } else {
+                user.clone().serve(transport).await.unwrap()
+            }
+        }
+
+        async fn call(client: &RunningService<RoleClient, User>, name: &'static str, args: Value) -> (bool, String) {
+            let r = client.call_tool(CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())).await.unwrap();
+            let body = r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect();
+            (r.is_error == Some(true), body)
+        }
+
+        /// The test has no WhatsApp connection, so a call that reaches the account fails with this.
+        const REACHED: &str = "WhatsApp client is not started";
+
+        #[tokio::test]
+        async fn sending_editing_and_deleting_ask_the_user_and_only_accept_goes_out() {
+            let (_dir, url) = serve().await;
+            let to = "5511900000001";
+            let calls = [
+                ("send_message", json!({"recipient": to, "message": "oi"}), "a mensagem \"oi\""),
+                ("send_file", json!({"recipient": to, "content_base64": "aGk=", "filename": "laudo.pdf"}), "arquivo laudo.pdf"),
+                ("send_audio_message", json!({"recipient": to, "media_path": "/x/nota.mp3"}), "áudio nota.mp3"),
+                ("edit_message", json!({"recipient": to, "message_id": "M1", "message": "novo"}), "mensagem M1"),
+                ("delete_message", json!({"recipient": to, "message_id": "M2"}), "mensagem M2"),
+            ];
+            for answer in [ElicitationAction::Decline, ElicitationAction::Cancel] {
+                let u = user(Some(answer));
+                let client = connect(&url, &u, true).await;
+                assert_eq!(client.peer_info().unwrap().protocol_version, ProtocolVersion::V_2026_07_28);
+                for (n, (name, args, target)) in calls.iter().enumerate() {
+                    let (is_error, body) = call(&client, name, args.clone()).await;
+                    assert!(!is_error && body.contains("nada foi enviado") && !body.contains(REACHED), "{name}: {body}");
+                    assert_eq!(u.asked.load(Ordering::SeqCst), n + 1, "{name}");
+                    let seen = u.seen.lock().unwrap().clone();
+                    assert!(seen.contains(target) && seen.contains(to) && seen.contains("Não dá para desfazer"), "{name}: {seen}");
+                }
+            }
+            let u = user(Some(ElicitationAction::Accept));
+            let client = connect(&url, &u, true).await;
+            for (name, args, _) in &calls {
+                let (is_error, body) = call(&client, name, args.clone()).await;
+                // The files stop at reading them (no such file here); the rest reach the account.
+                let reached = name.starts_with("send_") && *name != "send_message" || body.contains(REACHED);
+                assert!(is_error && reached && !body.contains("nada foi enviado"), "{name}: {body}");
+            }
+            assert_eq!(u.asked.load(Ordering::SeqCst), calls.len());
+            // Reactions, marking as read and reads never ask.
+            for (name, args) in [
+                ("send_reaction", json!({"recipient": to, "message_id": "M1", "emoji": "👍"})),
+                ("mark_chat_read", json!({"recipient": to})),
+                ("list_chats", json!({})),
+            ] {
+                call(&client, name, args).await;
+            }
+            assert_eq!(u.asked.load(Ordering::SeqCst), calls.len());
+            // Without elicitation, or on a legacy session that declares it, the call goes out as before.
+            for (answer, modern) in [(None, true), (None, false), (Some(ElicitationAction::Decline), false)] {
+                let u = user(answer);
+                let client = connect(&url, &u, modern).await;
+                let (is_error, body) = call(&client, "delete_message", json!({"recipient": to, "message_id": "M2"})).await;
+                assert!(is_error && body.contains(REACHED), "{body}");
+                assert_eq!(u.asked.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn discovery_and_the_tool_list_are_public_for_an_hour() {
+            let (_dir, url) = serve().await;
+            let client = connect(&url, &user(None), true).await;
+            let tools = client.list_tools(None).await.unwrap();
+            assert_eq!((tools.ttl_ms, tools.cache_scope), (Some(STATIC_TTL_MS), Some(CacheScope::Public)));
+            for t in &tools.tools {
+                assert_eq!(t.input_schema.get("type"), Some(&json!("object")), "{}", t.name);
+            }
+            // server/discover by hand: the client keeps only the negotiated version.
+            let meta = json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "teste", "version": "1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            let body = reqwest::Client::new()
+                .post(&url)
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header("Mcp-Method", "server/discover")
+                .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}}))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let data = body.lines().find_map(|l| l.strip_prefix("data:")).map_or(body.as_str(), str::trim);
+            let r: Value = serde_json::from_str(data).unwrap_or_else(|e| panic!("{e}: {body}"));
+            let r = &r["result"];
+            assert!(!r.is_null(), "{body}");
+            assert_eq!((r["ttlMs"].as_u64(), r["cacheScope"].as_str()), (Some(STATIC_TTL_MS), Some("public")), "{r}");
+            assert!(r["supportedVersions"].as_array().unwrap().contains(&json!("2026-07-28")), "{r}");
+            let info = &r["_meta"]["io.modelcontextprotocol/serverInfo"];
+            assert_eq!((info["name"].as_str(), info["title"].as_str()), (Some("whatsapp-mcp"), Some("WhatsApp")), "{r}");
+            assert!(r["instructions"].as_str().is_some_and(|i| !i.is_empty()));
+        }
+    }
+
     /// What the client gets: (isError, JSON body) or the JSON-RPC error.
     fn wire(r: R) -> Result<(bool, serde_json::Value), ErrorData> {
         let CallToolResponse::Complete(r) = r.into_call_tool_result()? else { panic!("not complete") };
@@ -785,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failures_are_tool_errors_and_bad_arguments_protocol_errors() {
+    async fn failures_and_bad_arguments_are_tool_errors() {
         let (_d, srv) = server(false);
         let args = serde_json::from_value(json!({ "chat_jid": "1@g.us" })).unwrap();
         let (is_error, body) = wire(srv.get_chat(Parameters(args)).await).unwrap();
@@ -796,9 +1106,11 @@ mod tests {
         let (is_error, body) = wire(srv.send_message(Parameters(args)).await).unwrap();
         assert!(is_error && body["success"] == false, "{body}");
         let args = serde_json::from_value(json!({ "recipient": "not a number", "message": "oi" })).unwrap();
-        assert_eq!(wire(srv.send_message(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
+        let (is_error, body) = wire(srv.send_message(Parameters(args)).await).unwrap();
+        assert!(is_error && body["message"].as_str().unwrap().contains("not a number"), "{body}");
         let args = serde_json::from_value(json!({ "after": "yesterday" })).unwrap();
-        assert_eq!(wire(srv.get_digest(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
+        let (is_error, body) = wire(srv.get_digest(Parameters(args)).await).unwrap();
+        assert!(is_error && body["message"].as_str().unwrap().contains("ISO-8601"), "{body}");
         let args = serde_json::from_value(json!({ "jid": "1@s.whatsapp.net" })).unwrap();
         assert_eq!(
             wire(srv.get_last_interaction(Parameters(args)).await).unwrap(),
@@ -823,13 +1135,13 @@ mod tests {
         let (_, body) = wire(srv.send_audio_message(Parameters(args)).await).unwrap();
         let token = body["upload_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
         assert!(srv.ctx.uploads.as_ref().unwrap().take(&token).unwrap().voice);
-        // Another source alongside is a tool error; no extension or a bad recipient, invalid params.
+        // Another source alongside, no extension or a bad recipient: each a tool error.
         let args = call(json!({ "recipient": "5511900000001", "filename": "a.pdf", "media_path": "/x.pdf", "return_upload_url": true }));
         assert!(wire(srv.send_file(Parameters(args)).await).unwrap().0);
         let args = call(json!({ "recipient": "5511900000001", "filename": "semextensao", "return_upload_url": true }));
-        assert_eq!(wire(srv.send_file(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
+        assert!(wire(srv.send_file(Parameters(args)).await).unwrap().0);
         let args = call(json!({ "recipient": "not a number", "filename": "a.pdf", "return_upload_url": true }));
-        assert_eq!(wire(srv.send_file(Parameters(args)).await).unwrap_err().code, ErrorCode::INVALID_PARAMS);
+        assert!(wire(srv.send_file(Parameters(args)).await).unwrap().0);
     }
 
     #[tokio::test]

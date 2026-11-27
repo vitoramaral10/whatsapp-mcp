@@ -4,3 +4,6 @@
 *.db-shm
 *.db-wal
 .env
+
+# Worktrees locais
+.claude/worktrees/

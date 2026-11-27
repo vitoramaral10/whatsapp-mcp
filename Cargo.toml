@@ -22,7 +22,7 @@ opus = "0.4"
 qrcode = { version = "0.14", default-features = false }
 # reqwest only talks plain HTTP to the whisper and embedding servers: no TLS stack.
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "json"] }
-rmcp = { version = "3.8.0", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.10.0", features = ["server", "macros", "transport-streamable-http-server"] }
 # 0.39 shares libsqlite3-sys with whatsapp-rust's diesel store.
 rusqlite = { version = "0.39", features = ["bundled"] }
 schemars = "1"
@@ -36,6 +36,8 @@ log = "0.4"
 whatsapp-rust = { version = "0.7.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
 
 [dev-dependencies]
+# A real client for the end-to-end tests: the 2026-07-28 lifecycle and MRTR, as the gateway speaks it.
+rmcp = { version = "3.10.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
 
 [profile.release]
