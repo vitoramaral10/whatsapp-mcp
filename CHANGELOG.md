@@ -5,6 +5,21 @@ and versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+- MCP 2026-07-28: a client that can ask its user (form elicitation) is asked to confirm, through
+  `input_required`, before `send_message`, `send_file`, `send_audio_message`, `edit_message` and
+  `delete_message`; a refusal sends nothing. Clients without elicitation, and older protocol versions,
+  work as before.
+- Every tool declares the four MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`); before, none did, so every tool read as destructive.
+- `server/discover` and `tools/list` say they may be cached for an hour by anyone (`ttlMs`, `cacheScope: public`);
+  the server's title is `WhatsApp`.
+
+### Changed
+- Bad arguments (a malformed recipient or date, a file name without an extension) are a tool error
+  with the message, like any other failure, instead of a JSON-RPC invalid_params error.
+- `rmcp` 3.10 at least.
+
 ## [0.3.1] - 2026-11-15
 
 ### Security
